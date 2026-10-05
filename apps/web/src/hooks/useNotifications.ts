@@ -19,9 +19,13 @@ export function useNotifications() {
 
         setNotifications((prev) => [...prev, { message, type, id }]);
 
-        setTimeout(() => {
-            setNotifications((prev) => prev.filter((n) => n.id !== id));
-        }, RECORDING_CONFIG.NOTIFICATIONS.AUTO_DISMISS_MS);
+        // Errors stay until dismissed so failures are never missed;
+        // success/info auto-dismiss as before.
+        if (type !== 'error') {
+            setTimeout(() => {
+                setNotifications((prev) => prev.filter((n) => n.id !== id));
+            }, RECORDING_CONFIG.NOTIFICATIONS.AUTO_DISMISS_MS);
+        }
     }, []);
 
     const removeNotification = useCallback((id: number) => {

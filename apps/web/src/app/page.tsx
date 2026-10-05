@@ -1,305 +1,821 @@
 'use client';
 
-import Link from 'next/link';
-import Image from 'next/image';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import RecordingControls from '@/components/RecordingControls';
+import Header from '@/components/Header';
+import VideoPreview from '@/components/VideoPreview';
+import MinimalVideoPlayer from '@/components/MinimalVideoPlayer';
+import PlaybackControls from '@/components/PlaybackControls';
+import CountdownOverlay from '@/components/CountdownOverlay';
+import Notification from '@/components/Notification';
+import DownloadSettingsModal, { DownloadSettings } from '@/components/DownloadSettingsModal';
+import MediaSettings from '@/components/MediaSettings';
+import { useMediaStreams } from '@/hooks/useMediaStreams';
+import { useRecording } from '@/hooks/useRecording';
+import { useCameraPosition } from '@/hooks/useCameraPosition';
+import { useNotifications } from '@/hooks/useNotifications';
+import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts';
+import { useDeviceList } from '@/hooks/useDeviceList';
+import { useAudioLevelMeter } from '@/hooks/useAudioLevelMeter';
+import { convertToMp4 as convertToMp4Api, ApiAuthError, ApiUnreachableError } from '@/services/api';
+import { saveBlob } from '@/utils/saveFile';
+import { isBlobReadable, StorageMode } from '@/utils/recordingStorage';
+import {
+  createWorkerCombinedStream,
+  forceCleanupCombinedStreams,
+} from '@/utils/workerStreamCombiner';
+import { getResolutionDimensions, ResolutionPreset } from '@/config/recording';
+import { RecordingLayout } from '@/types/layout';
 
-const COLORS = {
-  hero: '#f5c896',
-  cardBlue: '#dbeafe',
-  cardPurple: '#ede9fe',
-  cardGreen: '#d1fae5',
-} as const;
+const CAMERA_DEVICE_KEY = 'screenrec-camera-device';
+const MIC_DEVICE_KEY = 'screenrec-mic-device';
+const STORAGE_MODE_KEY = 'screenrec-storage-mode';
+const MIRROR_KEY = 'screenrec-mirror-preview';
 
-const NOISE_TEXTURE_SVG = `url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E")`;
-
-
-function NoiseOverlay({ opacity = 0.4 }: { opacity?: number }) {
-  return (
-    <div
-      aria-hidden="true"
-      className="absolute inset-0 mix-blend-overlay pointer-events-none"
-      style={{ backgroundImage: NOISE_TEXTURE_SVG, opacity }}
-    />
-  );
+interface EffectCapabilities {
+  blur: boolean | null;
+  greenScreen: boolean | null;
 }
 
-function GitHubIcon({ className = 'w-5 h-5' }: { className?: string }) {
+/** Capability fields from the native Background Blur / Segmentation Mask APIs. */
+type EffectCapFields = MediaTrackCapabilities & {
+  backgroundBlur?: boolean[];
+  backgroundSegmentationMask?: boolean[];
+};
+
+/** Constraint fields from the native Background Segmentation Mask API. */
+type GreenScreenConstraints = MediaTrackConstraints & {
+  backgroundSegmentationMask?: boolean;
+};
+
+export default function RecordPage() {
+  const [recordedBlob, setRecordedBlob] = useState<Blob | null>(null);
+  const [recordedVideoUrl, setRecordedVideoUrl] = useState<string | null>(null);
+  const [selectedLayout, setSelectedLayout] = useState<RecordingLayout>('pip');
+  const [countdown, setCountdown] = useState<number | null>(null);
+  const [isVideoLoading, setIsVideoLoading] = useState(false);
+  const [showDownloadModal, setShowDownloadModal] = useState(false);
+  const [isConverting, setIsConverting] = useState(false);
+  const [isMobile, setIsMobile] = useState(false);
+  const [conversionProgress, setConversionProgress] = useState(0);
+
+  // Device selection
+  const [cameraDeviceId, setCameraDeviceId] = useState('');
+  const [micDeviceId, setMicDeviceId] = useState('');
+
+  // Where recorded chunks are spooled: 'auto' | 'opfs' (disk) | 'memory'
+  const [storageMode, setStorageMode] = useState<StorageMode>('auto');
+
+  // Camera preview mirroring (self-view). Default on; recorded output unaffected.
+  const [mirrorPreview, setMirrorPreview] = useState(true);
+
+  // Output resolution
+  const [targetResolution, setTargetResolution] = useState<ResolutionPreset>('source');
+  const [sourceSize, setSourceSize] = useState<{ width: number; height: number } | null>(null);
+  // Actual dimensions of the recorded track (shown in the playback bar)
+  const [recordingMeta, setRecordingMeta] = useState<{ width: number; height: number } | null>(null);
+
+  // Native camera effects
+  const [effectCaps, setEffectCaps] = useState<EffectCapabilities>({ blur: null, greenScreen: null });
+  const [backgroundBlur, setBackgroundBlur] = useState(false);
+  const [greenScreen, setGreenScreen] = useState(false);
+  const [greenScreenColor, setGreenScreenColor] = useState('#00b140');
+
+  const screenVideoRef = useRef<HTMLVideoElement>(null);
+  const cameraVideoRef = useRef<HTMLVideoElement>(null);
+  const previewContainerRef = useRef<HTMLDivElement>(null);
+  const countdownIntervalRef = useRef<NodeJS.Timeout | null>(null);
+
+  const { notifications, showNotification, removeNotification } = useNotifications();
+  const { cameras, microphones, refresh: refreshDevices } = useDeviceList();
+
+  // Mobile detection
+  useEffect(() => {
+    const checkMobile = () => {
+      const ua = navigator.userAgent.toLowerCase();
+      const isMobileUA = /android|webos|iphone|ipad|ipod|blackberry|iemobile|opera mini/i.test(ua);
+      const isSmallScreen = window.innerWidth < 768;
+      const isTouchOnly = navigator.maxTouchPoints > 0 && !window.matchMedia('(hover: hover)').matches;
+      setIsMobile(isMobileUA || (isSmallScreen && isTouchOnly));
+    };
+    checkMobile();
+    window.addEventListener('resize', checkMobile);
+    return () => window.removeEventListener('resize', checkMobile);
+  }, []);
+
+  // Restore persisted device selection
+  useEffect(() => {
+    try {
+      setCameraDeviceId(localStorage.getItem(CAMERA_DEVICE_KEY) || '');
+      setMicDeviceId(localStorage.getItem(MIC_DEVICE_KEY) || '');
+      const storedMode = localStorage.getItem(STORAGE_MODE_KEY);
+      if (storedMode === 'auto' || storedMode === 'opfs' || storedMode === 'memory') {
+        setStorageMode(storedMode);
+      }
+      const storedMirror = localStorage.getItem(MIRROR_KEY);
+      if (storedMirror === 'on' || storedMirror === 'off') {
+        setMirrorPreview(storedMirror === 'on');
+      }
+    } catch { /* storage unavailable */ }
+  }, []);
+
+  const {
+    isScreenShared,
+    isCameraOn,
+    isMicOn,
+    screenStreamRef,
+    cameraStreamRef,
+    audioStreamRef,
+    handleShareScreen,
+    startCamera,
+    startMic,
+    stopCamera,
+    stopScreen,
+    stopMic,
+    stopAllStreams,
+    toggleCamera,
+    toggleMic,
+  } = useMediaStreams();
+
+  const {
+    isRecording,
+    isPaused,
+    recordingTime,
+    error: recordingError,
+    storageBackend,
+    storageDegraded,
+    startRecording,
+    stopRecording,
+    pauseRecording,
+    cleanup,
+    releaseStoredRecording,
+  } = useRecording({
+    storageMode,
+    onRecordingComplete: async (blob: Blob) => {
+      if (blob.size === 0) {
+        showNotification('Recording failed: no data captured', 'error');
+        return;
+      }
+      if (!(await isBlobReadable(blob))) {
+        showNotification('Recording could not be read back from storage — please record again', 'error');
+        return;
+      }
+
+      setRecordedBlob(blob);
+      const url = URL.createObjectURL(blob);
+      setRecordedVideoUrl(url);
+      showNotification('Recording saved!', 'success');
+    },
+  });
+
+  const {
+    cameraPosition,
+    isDragging,
+    handleCameraDragStart,
+    handleCameraDrag,
+    handleCameraDragEnd,
+    getCameraPositionClasses,
+    getCameraCanvasPosition,
+  } = useCameraPosition();
+
+  // Surface recorder/storage failures (errors persist until dismissed)
+  useEffect(() => {
+    if (recordingError) {
+      showNotification(recordingError.userMessage || recordingError.message, 'error');
+    }
+  }, [recordingError, showNotification]);
+
+  // VU meter tied to the active microphone stream (tap only, no output routing)
+  const micStream = isMicOn ? audioStreamRef.current : null;
+  const { level: micLevel, peak: micPeak } = useAudioLevelMeter(micStream);
+
+  // VU meter for the captured tab/system audio (present only in captures that include audio)
+  const [screenAudioStream, setScreenAudioStream] = useState<MediaStream | null>(null);
+  useEffect(() => {
+    const compute = () => {
+      const tracks = isScreenShared ? screenStreamRef.current?.getAudioTracks() ?? [] : [];
+      setScreenAudioStream((prev) => {
+        const prevTracks = prev ? prev.getAudioTracks() : [];
+        if (prevTracks.length === tracks.length && prevTracks.every((t, i) => t === tracks[i])) {
+          return prev;
+        }
+        return tracks.length > 0 ? new MediaStream(tracks) : null;
+      });
+    };
+    compute();
+    if (!isScreenShared) return;
+    const interval = setInterval(compute, 1000);
+    return () => clearInterval(interval);
+  }, [isScreenShared, screenStreamRef]);
+  const hasSystemAudio = screenAudioStream !== null;
+  const { level: systemLevel, peak: systemPeak } = useAudioLevelMeter(screenAudioStream);
+
+  // Source size readout: track settings of the active primary source
+  useEffect(() => {
+    const compute = () => {
+      const sTrack = screenStreamRef.current?.getVideoTracks()[0];
+      const cTrack = cameraStreamRef.current?.getVideoTracks()[0];
+      const settings = (sTrack ?? cTrack)?.getSettings();
+      if (settings?.width && settings?.height) {
+        setSourceSize({ width: settings.width, height: settings.height });
+      } else {
+        setSourceSize(null);
+      }
+    };
+    compute();
+    if (!isScreenShared && !isCameraOn) return;
+    const interval = setInterval(compute, 1000);
+    return () => clearInterval(interval);
+  }, [isScreenShared, isCameraOn, screenStreamRef, cameraStreamRef]);
+
+  // Native camera-effect capabilities (OS-side; no wasm)
+  useEffect(() => {
+    const probe = () => {
+      const track = cameraStreamRef.current?.getVideoTracks()[0];
+      if (!track || !isCameraOn) {
+        setEffectCaps({ blur: null, greenScreen: null });
+        setBackgroundBlur(false);
+        setGreenScreen(false);
+        return;
+      }
+      const caps = track.getCapabilities() as EffectCapFields | undefined;
+      setEffectCaps({
+        blur: caps?.backgroundBlur?.length === 2 ? true : null,
+        greenScreen: caps?.backgroundSegmentationMask?.length === 2 ? true : null,
+      });
+      setBackgroundBlur(!!track.getSettings().backgroundBlur);
+    };
+    probe();
+    // Capabilities can populate shortly after the track starts; re-probe once.
+    const timer = setTimeout(probe, 750);
+    return () => clearTimeout(timer);
+  }, [isCameraOn, cameraStreamRef]);
+
+  // Keep blur state in sync with OS-side toggles (macOS/ChromeOS control it externally)
+  useEffect(() => {
+    const track = cameraStreamRef.current?.getVideoTracks()[0];
+    if (!track || !isCameraOn) return;
+    const handler = () => setBackgroundBlur(!!track.getSettings().backgroundBlur);
+    track.addEventListener('configurationchange', handler as EventListener);
+    return () => track.removeEventListener('configurationchange', handler as EventListener);
+  }, [isCameraOn, cameraStreamRef]);
+
+  const handleShareScreenWithMobileCheck = useCallback(() => {
+    if (isMobile) {
+      showNotification('Screen sharing requires a desktop browser.', 'error');
+      return;
+    }
+    handleShareScreen();
+  }, [isMobile, showNotification, handleShareScreen]);
+
+  const handleStartCamera = useCallback(() => {
+    return toggleCamera(cameraDeviceId || null);
+  }, [toggleCamera, cameraDeviceId]);
+
+  const handleToggleMic = useCallback(() => {
+    return toggleMic(micDeviceId || null);
+  }, [toggleMic, micDeviceId]);
+
+  const handleCameraDeviceChange = useCallback(async (deviceId: string) => {
+    setCameraDeviceId(deviceId);
+    try { localStorage.setItem(CAMERA_DEVICE_KEY, deviceId); } catch { /* ignore */ }
+    if (cameraStreamRef.current) {
+      stopCamera();
+      await startCamera(deviceId || null);
+      refreshDevices();
+    }
+  }, [cameraStreamRef, stopCamera, startCamera, refreshDevices]);
+
+  const handleMicDeviceChange = useCallback(async (deviceId: string) => {
+    setMicDeviceId(deviceId);
+    try { localStorage.setItem(MIC_DEVICE_KEY, deviceId); } catch { /* ignore */ }
+    if (audioStreamRef.current) {
+      // Swap the device while keeping the mic on
+      stopMic();
+      await startMic(deviceId || null);
+      refreshDevices();
+    }
+  }, [audioStreamRef, stopMic, startMic, refreshDevices]);
+
+  const handleToggleBackgroundBlur = useCallback(async () => {
+    const track = cameraStreamRef.current?.getVideoTracks()[0];
+    if (!track) return;
+    const next = !backgroundBlur;
+    try {
+      await track.applyConstraints({ backgroundBlur: next });
+      setBackgroundBlur(next);
+    } catch {
+      showNotification('Could not change background blur on this device.', 'error');
+    }
+  }, [backgroundBlur, cameraStreamRef, showNotification]);
+
+  const handleToggleGreenScreen = useCallback(async () => {
+    const track = cameraStreamRef.current?.getVideoTracks()[0];
+    if (!track) return;
+    const next = !greenScreen;
+    try {
+      await track.applyConstraints({ backgroundSegmentationMask: next } as GreenScreenConstraints);
+      setGreenScreen(next);
+    } catch {
+      showNotification('Could not change green screen on this device.', 'error');
+    }
+  }, [greenScreen, cameraStreamRef, showNotification]);
+
+  useKeyboardShortcuts({
+    isRecording,
+    isCameraOn,
+    isScreenShared,
+    onPause: pauseRecording,
+    onToggleMic: handleToggleMic,
+    onToggleCamera: () => isCameraOn ? stopCamera() : handleStartCamera(),
+    onToggleScreen: () => isScreenShared ? stopScreen() : handleShareScreenWithMobileCheck(),
+  });
+
+  // Bind the live streams to whichever preview <video> element is mounted.
+  // Runs after every render (idempotently) because VideoPreview swaps elements
+  // when the layout mode changes (camera-only <-> PiP <-> screen-only).
+  useEffect(() => {
+    const videoElement = screenVideoRef.current;
+    const stream = screenStreamRef.current;
+    if (videoElement && videoElement.srcObject !== stream) {
+      videoElement.srcObject = stream;
+    }
+  });
+
+  useEffect(() => {
+    const videoElement = cameraVideoRef.current;
+    const stream = cameraStreamRef.current;
+    if (videoElement && videoElement.srcObject !== stream) {
+      videoElement.srcObject = stream;
+    }
+  });
+
+  useEffect(() => {
+    if (!recordedVideoUrl) {
+      setIsVideoLoading(false);
+      return;
+    }
+    setIsVideoLoading(false);
+  }, [recordedVideoUrl]);
+
+  // Keep the current object URL in a ref so the unmount cleanup below runs ONLY
+  // on unmount. Listing recordedVideoUrl in its deps used to tear down
+  // mid-session — stopping all capture streams and deleting the recording file
+  // behind the blob the UI had just started showing — every time a recording
+  // completed (and again for every later recording).
+  const recordedVideoUrlRef = useRef<string | null>(null);
+  useEffect(() => {
+    recordedVideoUrlRef.current = recordedVideoUrl;
+  }, [recordedVideoUrl]);
+
+  useEffect(
+    () => () => {
+      stopAllStreams();
+      cleanup();
+      if (recordedVideoUrlRef.current) {
+        URL.revokeObjectURL(recordedVideoUrlRef.current);
+      }
+      if (countdownIntervalRef.current) {
+        clearInterval(countdownIntervalRef.current);
+      }
+    },
+    [stopAllStreams, cleanup]
+  );
+
+  useEffect(() => {
+    if (isScreenShared && !screenStreamRef.current) {
+      showNotification('Screen share failed. Please try again.', 'error');
+    }
+  }, [isScreenShared, screenStreamRef, showNotification]);
+
+  useEffect(() => {
+    if (isCameraOn && !cameraStreamRef.current) {
+      showNotification('Camera access failed. Please check permissions.', 'error');
+    }
+  }, [isCameraOn, cameraStreamRef, showNotification]);
+
+  useEffect(() => {
+    if (isMicOn && !audioStreamRef.current) {
+      showNotification('Microphone access failed. Please check permissions.', 'error');
+    }
+  }, [isMicOn, audioStreamRef, showNotification]);
+
+  useEffect(() => {
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (isRecording) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    };
+
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [isRecording]);
+
+  const actuallyStartRecording = useCallback(async () => {
+    // Assigned once the combined stream exists so any later failure can release it
+    let releaseCombinedStream: (() => void) | null = null;
+    try {
+      if (!screenStreamRef.current && !cameraStreamRef.current && !audioStreamRef.current) {
+        showNotification('No media sources available to record', 'error');
+        return;
+      }
+
+      const { stream: combinedStream, cleanup: workerCleanup } = await createWorkerCombinedStream({
+        screenStream: screenStreamRef.current,
+        cameraStream: cameraStreamRef.current,
+        audioStream: audioStreamRef.current,
+        cameraPosition: getCameraCanvasPosition(),
+        cameraPositionKey: cameraPosition,
+        layout: selectedLayout,
+        targetResolution: getResolutionDimensions(targetResolution),
+        greenScreen: { enabled: greenScreen, color: greenScreenColor },
+      });
+      releaseCombinedStream = workerCleanup;
+
+      if (combinedStream.getTracks().length === 0) {
+        showNotification('No tracks available to record', 'error');
+        workerCleanup();
+        return;
+      }
+
+      // Capture the actual recorded dimensions for the playback bar
+      const recordedSettings = combinedStream.getVideoTracks()[0]?.getSettings();
+      setRecordingMeta(
+        recordedSettings?.width && recordedSettings?.height
+          ? { width: recordedSettings.width, height: recordedSettings.height }
+          : getResolutionDimensions(targetResolution) ?? sourceSize
+      );
+
+      setRecordedBlob(null);
+      setRecordedVideoUrl(null);
+
+      const started = await startRecording(combinedStream);
+      if (!started) {
+        // Already recording (e.g. a double-start) — release the unused stream
+        workerCleanup();
+        return;
+      }
+      showNotification('Recording started!', 'success');
+    } catch (error) {
+      releaseCombinedStream?.();
+      console.error('Error starting recording:', error);
+      showNotification('Failed to start recording. Please try again.', 'error');
+    }
+  }, [
+    screenStreamRef,
+    cameraStreamRef,
+    audioStreamRef,
+    getCameraCanvasPosition,
+    cameraPosition,
+    selectedLayout,
+    targetResolution,
+    sourceSize,
+    greenScreen,
+    greenScreenColor,
+    startRecording,
+    showNotification,
+  ]);
+
+  const startCountdown = useCallback(() => {
+    // A second click restarts the countdown instead of spawning a second one
+    // (two countdowns would start two recordings).
+    if (countdownIntervalRef.current) {
+      clearInterval(countdownIntervalRef.current);
+      countdownIntervalRef.current = null;
+    }
+    setCountdown(3);
+
+    countdownIntervalRef.current = setInterval(() => {
+      setCountdown((prev) => {
+        if (prev === null) {
+          if (countdownIntervalRef.current) {
+            clearInterval(countdownIntervalRef.current);
+          }
+          return null;
+        }
+
+        if (prev <= 1) {
+          if (countdownIntervalRef.current) {
+            clearInterval(countdownIntervalRef.current);
+            countdownIntervalRef.current = null;
+          }
+          setTimeout(() => {
+            actuallyStartRecording();
+          }, 100);
+          return null;
+        }
+
+        return prev - 1;
+      });
+    }, 1000);
+  }, [actuallyStartRecording]);
+
+  const handleStartRecording = useCallback(() => {
+    let hasValidSource = false;
+    const errorMessages: string[] = [];
+
+    if (isScreenShared) {
+      if (screenStreamRef.current) {
+        hasValidSource = true;
+      } else {
+        errorMessages.push('Screen share is not working');
+      }
+    }
+
+    if (isCameraOn) {
+      if (cameraStreamRef.current) {
+        hasValidSource = true;
+      } else {
+        errorMessages.push('Camera is not working');
+      }
+    }
+
+    if (isMicOn && !audioStreamRef.current) {
+      errorMessages.push('Microphone is not working');
+    }
+
+    if (errorMessages.length > 0) {
+      errorMessages.forEach((msg) => showNotification(msg, 'error'));
+      return;
+    }
+
+    if (!hasValidSource) {
+      showNotification('Please enable screen share or camera before recording', 'info');
+      return;
+    }
+
+    startCountdown();
+  }, [
+    isScreenShared,
+    isCameraOn,
+    isMicOn,
+    screenStreamRef,
+    cameraStreamRef,
+    audioStreamRef,
+    showNotification,
+    startCountdown,
+  ]);
+
+  const handleStopRecording = useCallback(() => {
+    // Stop the MediaRecorder first - this triggers onstop which creates the blob
+    stopRecording();
+
+    // Delay cleanup to allow MediaRecorder to finish processing
+    setTimeout(() => {
+      forceCleanupCombinedStreams();
+      stopAllStreams();
+    }, 500);
+  }, [stopRecording, stopAllStreams]);
+
+  const handleDownload = useCallback(() => {
+    if (!recordedBlob) return;
+    setShowDownloadModal(true);
+  }, [recordedBlob]);
+
+  const handleDownloadConfirm = useCallback(async (settings: DownloadSettings) => {
+    if (!recordedBlob) return;
+    setShowDownloadModal(false);
+
+    if (!(await isBlobReadable(recordedBlob))) {
+      showNotification('Recording file is missing from storage — nothing was downloaded. Please record again.', 'error');
+      return;
+    }
+
+    let blobToDownload = recordedBlob;
+    let extension = 'webm';
+
+    if (settings.format === 'mp4') {
+      setIsConverting(true);
+      setConversionProgress(0);
+      showNotification('Converting to MP4 via server...', 'info');
+      try {
+        const mp4Blob = await convertToMp4Api(recordedBlob, {
+          onProgress: setConversionProgress,
+          password: settings.password,
+        });
+        if (mp4Blob) {
+          blobToDownload = mp4Blob;
+          extension = 'mp4';
+          showNotification('Conversion complete!', 'success');
+        } else {
+          showNotification('MP4 conversion failed — downloading WebM instead', 'info');
+        }
+      } catch (error) {
+        if (error instanceof ApiAuthError) {
+          // Wrong password: do NOT silently substitute WebM — let the user retry
+          setIsConverting(false);
+          showNotification('Wrong password — MP4 was not converted. Your recording is still here; try again with the correct password.', 'error');
+          return;
+        }
+        const reason = error instanceof ApiUnreachableError
+          ? 'convert service unreachable'
+          : error instanceof Error ? error.message : 'unknown error';
+        showNotification(`MP4 conversion failed (${reason}) — downloading WebM instead`, 'info');
+      } finally {
+        setIsConverting(false);
+      }
+    }
+
+    const filename = settings.name
+      ? `${settings.name.replace(/[^a-zA-Z0-9-_]/g, '_')}.${extension}`
+      : `recording-${Date.now()}.${extension}`;
+    const saved = await saveBlob(blobToDownload, filename);
+    if (saved) {
+      showNotification('Recording downloaded successfully', 'success');
+    }
+  }, [recordedBlob, showNotification]);
+
+  const handleNewRecording = useCallback(() => {
+    if (recordedVideoUrl) {
+      URL.revokeObjectURL(recordedVideoUrl);
+    }
+    setRecordedBlob(null);
+    setRecordedVideoUrl(null);
+    // The UI has dropped the recording — release its storage (temp file)
+    releaseStoredRecording();
+  }, [recordedVideoUrl, releaseStoredRecording]);
+
+  const handleStorageModeChange = useCallback((mode: StorageMode) => {
+    setStorageMode(mode);
+    try { localStorage.setItem(STORAGE_MODE_KEY, mode); } catch { /* ignore */ }
+  }, []);
+
+  const handleToggleMirrorPreview = useCallback(() => {
+    const next = !mirrorPreview;
+    setMirrorPreview(next);
+    try { localStorage.setItem(MIRROR_KEY, next ? 'on' : 'off'); } catch { /* ignore */ }
+  }, [mirrorPreview]);
+
+  const handleCameraDragMove = useCallback(
+    (e: React.MouseEvent) => {
+      handleCameraDrag(e, previewContainerRef.current);
+    },
+    [handleCameraDrag]
+  );
+
+  const outputSize = getResolutionDimensions(targetResolution) ?? sourceSize;
+
   return (
-    <svg className={className} fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-      <path
-        fillRule="evenodd"
-        d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"
-        clipRule="evenodd"
+    <div className="fixed inset-0 bg-gray-900 flex flex-col">
+      <Header />
+
+      {/* Download Settings Modal */}
+      <DownloadSettingsModal
+        isOpen={showDownloadModal}
+        onClose={() => setShowDownloadModal(false)}
+        onDownload={handleDownloadConfirm}
+        videoBlob={recordedBlob}
       />
-    </svg>
-  );
-}
 
-function ShieldIcon({ className = 'w-8 h-8' }: { className?: string }) {
-  return (
-    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden="true">
-      <path
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        d="M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285z"
-      />
-    </svg>
-  );
-}
-
-function PlayIcon({ className = 'w-6 h-6' }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-      <path
-        fillRule="evenodd"
-        d="M4.5 5.653c0-1.426 1.529-2.38 2.792-1.645l11.54 6.348c1.263.733 1.263 2.57 0 3.303l-11.54 6.347c-1.263.733-2.792-.217-2.792-1.646V5.653Z"
-        clipRule="evenodd"
-      />
-    </svg>
-  );
-}
-
-function FeatureCard({
-  bgColor,
-  children,
-}: {
-  bgColor: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <article className="group relative rounded-2xl sm:rounded-3xl overflow-hidden min-h-[340px] sm:min-h-[380px] md:min-h-[420px] lg:min-h-[440px] flex flex-col shadow-[0_4px_24px_rgba(0,0,0,0.06)] hover:shadow-[0_8px_40px_rgba(0,0,0,0.1)] transition-all duration-300 hover:scale-[1.02] active:scale-[1.01]">
-      <div className="absolute inset-0" style={{ backgroundColor: bgColor }} />
-      <NoiseOverlay />
-      {children}
-    </article>
-  );
-}
-
-function RecordingButton({ className, children }: { className: string; children: React.ReactNode }) {
-  return (
-    <Link href="/record" className={className}>
-      {children}
-    </Link>
-  );
-}
-
-export default function Home() {
-  return (
-    <div className="min-h-screen bg-gray-50">
-      <header
-        className="fixed left-0 right-0 z-50 flex justify-center px-3 sm:px-4 lg:px-6"
-        style={{ top: 24 }}
-      >
-        <nav
-          className="flex h-[48px] sm:h-[52px] w-full max-w-3xl items-center justify-between rounded-[24px] sm:rounded-[26px] px-3 sm:px-4 backdrop-blur-2xl border border-white/40 shadow-[0_8px_32px_rgba(0,0,0,0.06),0_0_0_1px_rgba(255,255,255,0.3),inset_0_1px_0_rgba(255,255,255,0.8)]"
-          style={{ background: 'linear-gradient(180deg, #fff6 10%, #fffc)' }}
-          aria-label="Main navigation"
-        >
-          <Link href="/" className="flex items-center gap-1.5 sm:gap-2">
-            <Image src="/logo.png" alt="ScreenREC Logo" width={28} height={28} className="h-6 sm:h-7 w-auto" />
-            <span className="text-sm sm:text-[15px] font-bold tracking-tight text-gray-900">
-              ScreenREC
-            </span>
-          </Link>
-
-          <div className="flex items-center gap-2 sm:gap-3">
-            <a
-              href="https://github.com/heysagnik/screenREC"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="flex items-center gap-1.5 sm:gap-2 text-sm sm:text-[15px] text-gray-900 hover:text-gray-600 transition-colors"
-              aria-label="View on GitHub"
-            >
-              <GitHubIcon className="w-4 h-4 sm:w-5 sm:h-5" />
-              <span className="hidden sm:inline">GitHub</span>
-            </a>
-            <RecordingButton className="inline-flex items-center justify-center rounded-full bg-black h-8 sm:h-9 px-3.5 sm:px-5 text-xs sm:text-sm font-medium text-white hover:bg-neutral-800 transition-colors whitespace-nowrap">
-              Start Recording
-            </RecordingButton>
-          </div>
-        </nav>
-      </header>
-
-      <section
-        className="relative flex min-h-[85vh] sm:min-h-[88vh] md:min-h-[92vh] flex-col items-center justify-center overflow-hidden rounded-2xl sm:rounded-3xl mx-3 sm:mx-4 md:mx-6 mt-3 sm:mt-4 py-20 sm:py-24"
-        style={{ backgroundColor: COLORS.hero }}
-        aria-labelledby="hero-heading"
-      >
-        <NoiseOverlay opacity={0.35} />
-
-        <div
-          aria-hidden="true"
-          className="absolute inset-0 pointer-events-none"
-          style={{ background: 'radial-gradient(ellipse at 50% 0%, rgba(255,255,255,0.15) 0%, transparent 60%)' }}
-        />
-
-        <svg
-          aria-hidden="true"
-          className="absolute bottom-0 left-1/2 -translate-x-1/2 opacity-15 pointer-events-none w-full max-w-[1200px] h-auto"
-          width="1200"
-          height="400"
-          viewBox="0 0 1200 400"
-          fill="none"
-          preserveAspectRatio="xMidYMid slice"
-        >
-          <path
-            d="M50 350 Q200 150 400 280 T750 200 T1000 300 T1150 250"
-            stroke="white"
-            strokeWidth="100"
-            strokeLinecap="round"
-          />
-          <path
-            d="M100 380 Q250 200 450 320 T800 240 T1050 340"
-            stroke="white"
-            strokeWidth="70"
-            strokeLinecap="round"
-            opacity="0.5"
-          />
-        </svg>
-
-        <div className="z-20 flex flex-col items-center gap-4 sm:gap-5 md:gap-6 text-center px-4 sm:px-6">
-          <h1
-            id="hero-heading"
-            className="font-display text-[clamp(2.5rem,10vw,6.25rem)] sm:text-[clamp(3.5rem,8vw,5rem)] md:text-[clamp(4rem,7vw,6.25rem)] leading-[0.95] text-gray-900 max-w-5xl uppercase"
+      <div className="fixed top-16 sm:top-20 left-1/2 -translate-x-1/2 z-50 h-20 px-4 w-full max-w-md">
+        {notifications.slice().reverse().map((notification, index) => (
+          <div
+            key={notification.id}
+            className="absolute left-1/2 transition-all duration-200 w-full"
+            style={{
+              zIndex: 100 - index,
+              transform: `translateX(-50%) translateY(${index * -8}px)`,
+              opacity: index > 3 ? 0.4 : 1 - index * 0.1,
+            }}
           >
-            Record Crazy Videos
-            <br /> in secs
-          </h1>
-          <p className="text-gray-700/80 text-base sm:text-lg md:text-xl max-w-md sm:max-w-lg mt-1 sm:mt-2 leading-relaxed">
-            No installs. No accounts. Just record.
-          </p>
+            <Notification
+              message={notification.message}
+              type={notification.type}
+              onClose={() => removeNotification(notification.id)}
+            />
+          </div>
+        ))}
+      </div>
 
-          <RecordingButton className="mt-4 sm:mt-6 inline-flex items-center justify-center rounded-full h-12 sm:h-14 px-8 sm:px-10 text-base sm:text-lg font-medium text-gray-900 transition-all hover:scale-[1.02] active:scale-[0.98] bg-white/90 backdrop-blur-sm border border-white/60 shadow-[0_8px_32px_rgba(0,0,0,0.1),0_2px_8px_rgba(0,0,0,0.05),inset_0_1px_0_rgba(255,255,255,0.9)] hover:shadow-[0_12px_40px_rgba(0,0,0,0.15)]">
-            <PlayIcon className="w-5 h-5 sm:w-6 sm:h-6 mr-2" />
-            Start Recording
-          </RecordingButton>
-        </div>
-      </section>
-
-      <section id="features" className="px-3 sm:px-4 md:px-6 py-16 sm:py-20 md:py-28 lg:py-32" aria-labelledby="features-heading">
-        <div className="mx-auto max-w-6xl">
-          <header className="text-center mb-10 sm:mb-12 md:mb-14">
-            <span className="text-xs sm:text-sm font-medium tracking-[0.15em] sm:tracking-[0.2em] text-gray-500 uppercase">
-              Features
-            </span>
-            <h2
-              id="features-heading"
-              className="font-display mt-3 sm:mt-4 text-[clamp(1.75rem,6vw,3.5rem)] sm:text-[clamp(2.25rem,5vw,3rem)] md:text-[clamp(2.5rem,4.5vw,3.5rem)] leading-[1.05] tracking-tight text-gray-900 uppercase px-4"
-            >
-              Everything You Need
-              <br className="hidden sm:block" /> to Create Amazing Videos
-            </h2>
-            <p className="mt-4 sm:mt-5 text-gray-600 max-w-xl mx-auto text-sm sm:text-base md:text-lg leading-relaxed px-4">
-              Record your screen, add your camera, and share with the world — all from your browser
-            </p>
-          </header>
-
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 sm:gap-5 md:gap-6">
-            <FeatureCard bgColor={COLORS.cardBlue}>
-              <div className="relative z-10 p-4 sm:p-5 md:p-6 pt-6 sm:pt-7 md:pt-8 text-center">
-                <h3 className="text-lg sm:text-xl font-semibold text-gray-900">Recording Modes</h3>
-                <p className="mt-1.5 sm:mt-2 text-xs sm:text-sm text-gray-700 leading-relaxed">
-                  Screen, camera, or both —
-                  <br />picture-in-picture made easy
-                </p>
-              </div>
-
-              <div className="relative z-10 flex-1 flex items-center justify-center px-4 sm:px-5 md:px-6 pb-4 sm:pb-5 md:pb-6">
-                <div className="relative w-full max-w-[220px] sm:max-w-[240px] md:max-w-[260px] aspect-[4/3] bg-white/60 backdrop-blur-md rounded-lg sm:rounded-xl border border-white/60 shadow-2xl overflow-hidden group-hover:scale-[1.03] transition-transform duration-500">
-                  <div className="p-3 sm:p-4 space-y-2 sm:space-y-3 opacity-80">
-                    <div className="flex gap-2 sm:gap-3">
-                      <div className="w-8 h-8 sm:w-10 sm:h-10 rounded-lg bg-blue-600/10" />
-                      <div className="flex-1 space-y-1.5 sm:space-y-2 py-0.5 sm:py-1">
-                        <div className="h-1.5 sm:h-2 w-2/3 bg-blue-900/10 rounded-full" />
-                        <div className="h-1.5 sm:h-2 w-full bg-blue-900/5 rounded-full" />
-                      </div>
-                    </div>
-                    <div className="h-16 sm:h-20 rounded-lg bg-blue-600/5 border border-blue-600/10" />
-                  </div>
-
-                  <div className="absolute bottom-2 right-2 sm:bottom-3 sm:right-3 w-16 h-12 sm:w-20 sm:h-14 bg-gray-900 rounded-md sm:rounded-lg shadow-[0_4px_12px_rgba(0,0,0,0.2)] border-2 border-white flex items-center justify-center overflow-hidden group-hover:scale-110 group-hover:-translate-y-1 transition-all duration-300">
-                    <div className="w-6 h-6 sm:w-8 sm:h-8 rounded-full bg-gray-700 flex items-end justify-center overflow-hidden">
-                      <div className="w-5 h-2.5 sm:w-6 sm:h-3 bg-gray-500 rounded-t-full" />
-                    </div>
-                    <div className="absolute top-1 right-1 sm:top-1.5 sm:right-1.5 w-1 h-1 sm:w-1.5 sm:h-1.5 bg-red-500 rounded-full animate-pulse" />
-                  </div>
-                </div>
-              </div>
-            </FeatureCard>
-
-            <FeatureCard bgColor={COLORS.cardPurple}>
-              <div className="relative z-10 p-4 sm:p-5 md:p-6 pt-6 sm:pt-7 md:pt-8 text-center">
-                <h3 className="text-lg sm:text-xl font-semibold text-gray-900">Resolution & Export</h3>
-                <p className="mt-1.5 sm:mt-2 text-xs sm:text-sm text-gray-700 leading-relaxed">
-                  Up to 4K quality with
-                  <br />multiple export formats
-                </p>
-              </div>
-
-              <div className="relative z-10 flex-1 flex items-center justify-center px-4 sm:px-5 md:px-6 pb-4 sm:pb-5 md:pb-6">
-                <div className="relative w-full max-w-[200px] sm:max-w-[220px] md:max-w-[240px] h-[140px] sm:h-[150px] md:h-[160px]">
-                  <div className="absolute left-0 top-1 sm:top-2 bg-white/95 backdrop-blur-sm rounded-lg sm:rounded-xl shadow-xl p-3 sm:p-4 w-[120px] sm:w-[130px] md:w-[140px] -rotate-3 border border-white/50 group-hover:-rotate-1 group-hover:-translate-y-1 transition-all duration-300">
-                    <p className="text-[10px] sm:text-xs font-semibold text-gray-900 mb-2 sm:mb-3">Resolution</p>
-                    <div className="space-y-1.5 sm:space-y-2">
-                      {['720p HD', '1080p Full HD', '4K Ultra HD'].map((item, i) => (
-                        <div key={item} className="flex items-center gap-1.5 sm:gap-2 text-[10px] sm:text-xs">
-                          <span className={`h-2 w-2 sm:h-2.5 sm:w-2.5 rounded-full ${i === 2 ? 'bg-violet-500' : 'bg-gray-200'}`} />
-                          <span className={i === 2 ? 'text-gray-900 font-medium' : 'text-gray-500'}>{item}</span>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-
-                  <div className="absolute right-0 bottom-0 bg-white/95 backdrop-blur-sm rounded-lg sm:rounded-xl shadow-xl p-3 sm:p-4 w-[120px] sm:w-[130px] md:w-[140px] rotate-3 border border-white/50 group-hover:rotate-1 group-hover:-translate-y-1 transition-all duration-300">
-                    <p className="text-[10px] sm:text-xs font-semibold text-gray-900 mb-2 sm:mb-3">Export Format</p>
-                    <div className="space-y-1.5 sm:space-y-2">
-                      {['MP4 (H.264)', 'WebM (VP9)', 'GIF'].map((item, i) => (
-                        <div key={item} className="flex items-center gap-1.5 sm:gap-2 text-[10px] sm:text-xs">
-                          <span className={`h-2 w-2 sm:h-2.5 sm:w-2.5 rounded ${i === 0 ? 'bg-violet-500' : 'bg-gray-200'}`} />
-                          <span className={i === 0 ? 'text-gray-900 font-medium' : 'text-gray-500'}>{item}</span>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </FeatureCard>
-
-            <FeatureCard bgColor={COLORS.cardGreen}>
-              <div className="relative z-10 p-4 sm:p-5 md:p-6 pt-6 sm:pt-7 md:pt-8 text-center">
-                <h3 className="text-lg sm:text-xl font-semibold text-gray-900">Privacy & Open Source</h3>
-                <p className="mt-1.5 sm:mt-2 text-xs sm:text-sm text-gray-700/90 leading-relaxed max-w-xs mx-auto">
-                  100% client-side processing — your data never leaves your browser
-                </p>
-              </div>
-
-              <div className="relative z-10 flex-1 flex flex-col items-center justify-center px-4 sm:px-5 md:px-6 pb-6 sm:pb-7 md:pb-8 gap-5 sm:gap-6">
-                <div className="relative">
-                  <div className="absolute inset-0 bg-emerald-400/20 rounded-[20px] sm:rounded-[24px] blur-xl group-hover:bg-emerald-400/30 transition-colors duration-500" />
-                  <div className="relative w-20 h-20 sm:w-24 sm:h-24 bg-gradient-to-br from-white to-emerald-50/50 backdrop-blur-sm rounded-[18px] sm:rounded-[22px] shadow-[0_8px_32px_rgba(16,185,129,0.15),0_2px_8px_rgba(0,0,0,0.05)] border-2 border-white/80 flex items-center justify-center group-hover:scale-110 group-hover:-translate-y-2 group-hover:shadow-[0_16px_48px_rgba(16,185,129,0.25),0_4px_16px_rgba(0,0,0,0.08)] transition-all duration-500">
-                    <ShieldIcon className="w-9 h-9 sm:w-11 sm:h-11 text-emerald-600 group-hover:text-emerald-700 transition-colors duration-300" />
-                  </div>
-                </div>
-
-                <div className="flex flex-wrap items-center justify-center gap-2.5 sm:gap-3 w-full max-w-[280px]">
-                  <div className="inline-flex items-center gap-1.5 sm:gap-2 bg-white/95 backdrop-blur-sm rounded-lg sm:rounded-xl shadow-[0_2px_12px_rgba(0,0,0,0.08)] px-3 py-2 sm:px-3.5 sm:py-2.5 border border-white/60 group-hover:shadow-[0_4px_20px_rgba(0,0,0,0.12)] group-hover:-translate-y-0.5 transition-all duration-300">
-                    <GitHubIcon className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-gray-700" />
-                    <span className="text-[11px] sm:text-xs font-medium text-gray-700">Open source</span>
-                  </div>
-
-                  <div className="inline-flex items-center gap-1.5 sm:gap-2 bg-emerald-50/90 backdrop-blur-sm rounded-lg sm:rounded-xl shadow-[0_2px_12px_rgba(16,185,129,0.08)] px-3 py-2 sm:px-3.5 sm:py-2.5 border border-emerald-100/60 group-hover:shadow-[0_4px_20px_rgba(16,185,129,0.15)] group-hover:-translate-y-0.5 transition-all duration-300">
-                    <span className="relative flex h-2 w-2 sm:h-2.5 sm:w-2.5">
-                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
-                      <span className="relative inline-flex rounded-full h-2 w-2 sm:h-2.5 sm:w-2.5 bg-emerald-500" />
-                    </span>
-                    <span className="text-[11px] sm:text-xs font-medium text-emerald-900">Local only</span>
-                  </div>
-                </div>
-              </div>
-            </FeatureCard>
+      {/* Converting Overlay */}
+      {isConverting && (
+        <div className="fixed inset-0 z-40 bg-black/80 flex items-center justify-center p-4">
+          <div className="bg-gray-800 border border-gray-700 rounded-2xl p-6 sm:p-8 shadow-2xl flex flex-col items-center gap-3 sm:gap-4 max-w-sm w-full mx-4">
+            <div className="w-12 h-12 sm:w-16 sm:h-16 border-4 border-indigo-500/30 border-t-indigo-400 rounded-full animate-spin" />
+            <h3 className="text-lg sm:text-xl font-semibold text-gray-100">Converting to MP4</h3>
+            <p className="text-sm sm:text-base text-gray-400 text-center">Please wait while your recording is being converted...</p>
+            <div className="w-full bg-gray-700 rounded-full h-2">
+              <div
+                className="bg-indigo-500 h-2 rounded-full transition-all duration-300"
+                style={{ width: `${conversionProgress}%` }}
+              />
+            </div>
+            <span className="text-xs sm:text-sm text-gray-400">{conversionProgress}%</span>
           </div>
         </div>
-      </section>
+      )}
+
+      <main className="flex-1 overflow-y-auto p-4 sm:p-6 md:p-8">
+        <div className="flex flex-col items-center gap-4 sm:gap-6 md:gap-8 w-full max-w-4xl mx-auto">
+          {recordedVideoUrl ? (
+            <div className="w-full flex flex-col gap-4 sm:gap-5 md:gap-6">
+              <div className="w-full">
+                {isVideoLoading && (
+                  <div className="w-full aspect-video rounded-xl sm:rounded-2xl bg-gray-800 border border-gray-700 shadow-lg flex items-center justify-center">
+                    <div className="flex flex-col items-center gap-2 sm:gap-3">
+                      <div className="w-10 h-10 sm:w-12 sm:h-12 border-4 border-white/30 border-t-white rounded-full animate-spin" />
+                      <p className="text-white text-xs sm:text-sm font-medium">Loading video...</p>
+                    </div>
+                  </div>
+                )}
+                {!isVideoLoading && recordedVideoUrl && (
+                  <MinimalVideoPlayer src={recordedVideoUrl} />
+                )}
+              </div>
+
+              {/* Controls - Bottom */}
+              <PlaybackControls
+                onDownload={handleDownload}
+                onNewRecording={handleNewRecording}
+                videoBlob={recordedBlob}
+                resolution={recordingMeta}
+                storageBackend={storageBackend}
+                storageDegraded={storageDegraded}
+              />
+            </div>
+          ) : (
+            <div className="relative w-full" onMouseMove={handleCameraDragMove} onMouseUp={handleCameraDragEnd}>
+              {countdown !== null && <CountdownOverlay count={countdown} />}
+
+              <VideoPreview
+                ref={previewContainerRef}
+                isScreenShared={isScreenShared}
+                isCameraOn={isCameraOn}
+                isRecording={isRecording}
+                isPaused={isPaused}
+                recordingTime={recordingTime}
+                screenVideoRef={screenVideoRef}
+                cameraVideoRef={cameraVideoRef}
+                cameraPositionClasses={getCameraPositionClasses()}
+                isDragging={isDragging}
+                selectedLayout={selectedLayout}
+                mirrorPreview={mirrorPreview}
+                onShareScreen={handleShareScreenWithMobileCheck}
+                onStartCamera={handleStartCamera}
+                onStopCamera={stopCamera}
+                onCameraDragStart={handleCameraDragStart}
+              />
+            </div>
+          )}
+
+          {!recordedVideoUrl && (
+            <>
+              <MediaSettings
+                cameras={cameras}
+                microphones={microphones}
+                selectedCameraId={cameraDeviceId}
+                selectedMicId={micDeviceId}
+                onCameraChange={handleCameraDeviceChange}
+                onMicChange={handleMicDeviceChange}
+                resolution={targetResolution}
+                onResolutionChange={setTargetResolution}
+                sourceSize={sourceSize}
+                outputSize={outputSize}
+                micLevel={micLevel}
+                micPeak={micPeak}
+                isMicOn={isMicOn}
+                systemLevel={systemLevel}
+                systemPeak={systemPeak}
+                hasSystemAudio={hasSystemAudio}
+                backgroundBlur={effectCaps.blur === true ? backgroundBlur : null}
+                onToggleBackgroundBlur={handleToggleBackgroundBlur}
+                greenScreen={effectCaps.greenScreen === true ? greenScreen : null}
+                onToggleGreenScreen={handleToggleGreenScreen}
+                greenScreenColor={greenScreenColor}
+                onGreenScreenColorChange={setGreenScreenColor}
+                storageMode={storageMode}
+                storageBackend={storageBackend}
+                storageDegraded={storageDegraded}
+                onStorageModeChange={handleStorageModeChange}
+                mirrorPreview={mirrorPreview}
+                onToggleMirrorPreview={handleToggleMirrorPreview}
+                isCameraOn={isCameraOn}
+                disabled={isRecording}
+              />
+
+              <RecordingControls
+                onStartRecording={handleStartRecording}
+                onStopRecording={handleStopRecording}
+                onPauseRecording={pauseRecording}
+                onShareScreen={handleShareScreenWithMobileCheck}
+                onStopScreen={stopScreen}
+                onStartCamera={handleStartCamera}
+                onStopCamera={stopCamera}
+                onToggleMic={handleToggleMic}
+                onLayoutChange={setSelectedLayout}
+                isRecording={isRecording}
+                isPaused={isPaused}
+                isCameraActive={isCameraOn}
+                isMicActive={isMicOn}
+                isScreenSharing={isScreenShared}
+                canRecord={isScreenShared || isCameraOn}
+                selectedLayout={selectedLayout}
+              />
+            </>
+          )}
+        </div>
+      </main>
     </div>
   );
 }

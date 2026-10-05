@@ -85,6 +85,37 @@ export const RECORDING_CONFIG = {
 } as const;
 
 /**
+ * Output resolution presets
+ * Used to size the capture canvas so the recorded output size is controlled.
+ * 'source' keeps the native size of whatever is being recorded.
+ */
+export type ResolutionPreset = 'source' | '1440p' | '1080p' | '720p' | '480p';
+
+export interface ResolutionOption {
+  id: ResolutionPreset;
+  label: string;
+  width?: number;
+  height?: number;
+}
+
+export const RESOLUTION_OPTIONS: ResolutionOption[] = [
+  { id: 'source', label: 'Match source' },
+  { id: '1440p', label: '1440p', width: 2560, height: 1440 },
+  { id: '1080p', label: '1080p', width: 1920, height: 1080 },
+  { id: '720p', label: '720p', width: 1280, height: 720 },
+  { id: '480p', label: '480p', width: 854, height: 480 },
+];
+
+/**
+ * Resolve a preset to canvas dimensions, or null for "match source"
+ */
+export function getResolutionDimensions(preset: ResolutionPreset): { width: number; height: number } | null {
+  const option = RESOLUTION_OPTIONS.find((o) => o.id === preset);
+  if (!option || !option.width || !option.height) return null;
+  return { width: option.width, height: option.height };
+}
+
+/**
  * Supported codecs in priority order
  */
 export const SUPPORTED_CODECS = [
@@ -122,13 +153,14 @@ export function getScreenCaptureConstraints() {
 
 /**
  * Helper to get camera capture constraints
+ * Pass a deviceId to target a specific camera; otherwise the browser default is used.
  */
-export function getCameraCaptureConstraints() {
+export function getCameraCaptureConstraints(deviceId?: string | null) {
   return {
     video: {
+      ...(deviceId ? { deviceId: { exact: deviceId } } : { facingMode: 'user' as const }),
       width: { ideal: RECORDING_CONFIG.VIDEO.CAMERA.IDEAL_WIDTH },
       height: { ideal: RECORDING_CONFIG.VIDEO.CAMERA.IDEAL_HEIGHT },
-      facingMode: 'user' as const,
       frameRate: { 
         ideal: RECORDING_CONFIG.VIDEO.CAMERA.FRAMERATE, 
         max: RECORDING_CONFIG.VIDEO.CAMERA.FRAMERATE 
@@ -140,10 +172,12 @@ export function getCameraCaptureConstraints() {
 
 /**
  * Helper to get microphone capture constraints
+ * Pass a deviceId to target a specific microphone; otherwise the browser default is used.
  */
-export function getMicrophoneCaptureConstraints() {
+export function getMicrophoneCaptureConstraints(deviceId?: string | null) {
   return {
     audio: {
+      ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
       echoCancellation: RECORDING_CONFIG.AUDIO.ECHO_CANCELLATION,
       noiseSuppression: RECORDING_CONFIG.AUDIO.NOISE_SUPPRESSION,
       autoGainControl: RECORDING_CONFIG.AUDIO.AUTO_GAIN_CONTROL,

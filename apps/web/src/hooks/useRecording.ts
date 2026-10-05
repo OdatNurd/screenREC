@@ -1,18 +1,37 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { SUPPORTED_CODECS, RECORDING_CONFIG } from '@/config/recording';
+import {
+  createRecordingSink,
+  RecordingSink,
+  StorageBackend,
+  StorageMode,
+} from '@/utils/recordingStorage';
 
 interface UseRecordingOptions {
   onRecordingComplete: (blob: Blob) => void;
+  /** Where to spool recorded chunks. See recordingStorage for mode semantics. */
+  storageMode?: StorageMode;
 }
 
-export function useRecording({ onRecordingComplete }: UseRecordingOptions) {
+export function useRecording({ onRecordingComplete, storageMode = 'auto' }: UseRecordingOptions) {
   const [isRecording, setIsRecording] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   const [recordingTime, setRecordingTime] = useState(0);
   const [error, setError] = useState<RecordingError | null>(null);
+  const [storageBackend, setStorageBackend] = useState<StorageBackend | null>(null);
+  /** True only when disk was forced and the sink actually had to fall back to RAM. */
+  const [storageDegraded, setStorageDegraded] = useState(false);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
+  /** Sink still receiving chunks (write phase). */
+  const sinkRef = useRef<RecordingSink | null>(null);
+  /**
+   * Sink whose finished file backs the recording currently held by the UI.
+   * Its file must NOT be deleted until the UI drops that recording — see the
+   * ownership notes in recordingStorage. Deleting it early turns the handed-out
+   * blob into a zombie (stale size, every read throws).
+   */
+  const keptSinkRef = useRef<RecordingSink | null>(null);
   const timerIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const isPausedRef = useRef(false);
   const isStoppingRef = useRef(false);
@@ -28,22 +47,14 @@ export function useRecording({ onRecordingComplete }: UseRecordingOptions) {
     }
   }, []);
 
-  const createBlobFromChunks = useCallback((mimeType: string): Blob => {
-    const tryTypes = [mimeType, 'video/webm;codecs=vp8,opus', 'video/webm'].filter(Boolean);
-
-    for (const type of tryTypes) {
-      try {
-        const blob = new Blob(chunksRef.current, { type });
-        if (blob.size > 0) return blob;
-      } catch { /* continue to next type */ }
-    }
-
-    return new Blob(chunksRef.current, { type: 'video/webm' });
-  }, []);
-
-  const startRecording = useCallback(async (stream: MediaStream) => {
-    if (isStoppingRef.current || mediaRecorderRef.current?.state === 'recording') {
-      return;
+  const startRecording = useCallback(async (stream: MediaStream): Promise<boolean> => {
+    // 'paused' counts as active — restarting over a paused recorder would
+    // detach (and destroy) its still-live sink.
+    if (
+      isStoppingRef.current ||
+      (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive')
+    ) {
+      return false;
     }
 
     setError(null);
@@ -68,18 +79,41 @@ export function useRecording({ onRecordingComplete }: UseRecordingOptions) {
       );
     }
 
-    const mediaRecorder = new MediaRecorder(stream, {
-      mimeType: codec.mimeType,
-      videoBitsPerSecond: codec.videoBitsPerSecond,
-      audioBitsPerSecond: RECORDING_CONFIG.AUDIO.BITRATE,
-    });
+    // Release the previous recording's stored file (the UI has dropped it by
+    // now — a new recording replaces the previous one) plus any unfinished sink.
+    const previousSink = sinkRef.current;
+    sinkRef.current = null;
+    void previousSink?.discard();
+    const previousKept = keptSinkRef.current;
+    keptSinkRef.current = null;
+    void previousKept?.discard();
+
+    // Chunks are spooled to disk (OPFS) so RAM stays flat for long recordings
+    const sink = await createRecordingSink(codec.mimeType || 'video/webm', storageMode);
+    sinkRef.current = sink;
+    setStorageBackend(sink.backend);
+    setStorageDegraded(storageMode === 'opfs' && sink.backend === 'memory');
+
+    // If the encoder refuses this stream/mime, release the just-created sink so
+    // no orphaned temp file is left behind, then let the caller report it.
+    let mediaRecorder: MediaRecorder;
+    try {
+      mediaRecorder = new MediaRecorder(stream, {
+        mimeType: codec.mimeType,
+        videoBitsPerSecond: codec.videoBitsPerSecond,
+        audioBitsPerSecond: RECORDING_CONFIG.AUDIO.BITRATE,
+      });
+    } catch (err) {
+      if (sinkRef.current === sink) sinkRef.current = null;
+      await sink.discard();
+      throw err;
+    }
 
     mediaRecorderRef.current = mediaRecorder;
-    chunksRef.current = [];
 
     mediaRecorder.ondataavailable = (event) => {
       if (event.data?.size > 0) {
-        chunksRef.current.push(event.data);
+        sink.write(event.data);
       }
     };
 
@@ -99,15 +133,45 @@ export function useRecording({ onRecordingComplete }: UseRecordingOptions) {
       setIsPaused(false);
       isStoppingRef.current = false;
 
-      if (chunksRef.current.length > 0) {
-        const blob = createBlobFromChunks(mediaRecorder.mimeType);
-        onRecordingComplete(blob);
-      }
-
-      chunksRef.current = [];
+      void (async () => {
+        // The sink was replaced or discarded (e.g. page unmount) - nothing to finish
+        if (sinkRef.current !== sink) return;
+        try {
+          const result = await sink.finish();
+          if (sinkRef.current === sink) sinkRef.current = null;
+          // From here on the returned blob OWNS the sink's file; it may only be
+          // released once the UI drops the recording.
+          keptSinkRef.current = sink;
+          if (result.size > 0) {
+            onRecordingComplete(result.blob);
+          } else {
+            setError(new RecordingError(
+              RecordingErrorCode.RECORDER_FAILED,
+              'Recording produced no data',
+              true,
+              'Recording failed: no data captured'
+            ));
+          }
+        } catch (err) {
+          if (sinkRef.current === sink) sinkRef.current = null;
+          setError(new RecordingError(
+            RecordingErrorCode.RECORDER_FAILED,
+            'Failed to store recording',
+            true,
+            err instanceof Error ? `Failed to save the recording: ${err.message}` : 'Failed to save the recording to disk'
+          ));
+        }
+      })();
     };
 
-    mediaRecorder.start(1000);
+    try {
+      mediaRecorder.start(1000);
+    } catch (err) {
+      mediaRecorderRef.current = null;
+      if (sinkRef.current === sink) sinkRef.current = null;
+      await sink.discard();
+      throw err;
+    }
     setIsRecording(true);
     setRecordingTime(0);
 
@@ -116,7 +180,21 @@ export function useRecording({ onRecordingComplete }: UseRecordingOptions) {
         setRecordingTime((prev) => prev + 1);
       }
     }, 1000);
-  }, [onRecordingComplete, clearTimer, createBlobFromChunks]);
+
+    return true;
+  }, [onRecordingComplete, clearTimer, storageMode]);
+
+  /** Drop the stored recording the UI has released (e.g. "New recording"). */
+  const releaseStoredRecording = useCallback(() => {
+    const kept = keptSinkRef.current;
+    keptSinkRef.current = null;
+    void kept?.discard();
+    // No recording in the UI anymore: the storage badge goes back to showing
+    // the mode ("Storage: Automatic / Disk (forced) / RAM (forced)") instead of
+    // where the released recording had been stored.
+    setStorageBackend(null);
+    setStorageDegraded(false);
+  }, []);
 
   const stopRecording = useCallback(() => {
     const recorder = mediaRecorderRef.current;
@@ -159,7 +237,10 @@ export function useRecording({ onRecordingComplete }: UseRecordingOptions) {
     });
 
     mediaRecorderRef.current = null;
-    chunksRef.current = [];
+    void sinkRef.current?.discard();
+    sinkRef.current = null;
+    void keptSinkRef.current?.discard();
+    keptSinkRef.current = null;
     isStoppingRef.current = false;
   }, [clearTimer]);
 
@@ -170,10 +251,13 @@ export function useRecording({ onRecordingComplete }: UseRecordingOptions) {
     isPaused,
     recordingTime,
     error,
+    storageBackend,
+    storageDegraded,
     startRecording,
     stopRecording,
     pauseRecording,
     cleanup,
+    releaseStoredRecording,
   };
 }
 

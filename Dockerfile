@@ -1,53 +1,77 @@
-# Build stage - uses pnpm workspace for building
-FROM node:20-alpine AS builder
+# Single-container deployment: Next.js frontend + Express API + FFmpeg + nginx.
+#
+# Base is node:20-bullseye on purpose: the destination host runs an older
+# kernel/glibc and newer images can crash in clone3/seccomp. Debian bullseye's
+# glibc 2.31 avoids that, and apt provides both ffmpeg and nginx.
+#
+# Build:  docker build -t screenrec .
+# Run:    docker run -d -p 8080:80 -e API_USER=api -e API_PASSWORD=secret screenrec
+
+# =============================================
+# Build stage
+# =============================================
+FROM node:20-bullseye AS builder
+
+RUN npm install -g pnpm@9.15.1
 
 WORKDIR /app
 
-# Install pnpm
-RUN corepack enable && corepack prepare pnpm@9.15.1 --activate
+# Copy the whole workspace (the build copies local sources rather than cloning
+# a git repo, so local changes are included)
+COPY pnpm-workspace.yaml package.json pnpm-lock.yaml turbo.json ./
+COPY apps ./apps
+COPY packages ./packages
 
-# Copy ALL workspace files needed for build
-COPY pnpm-workspace.yaml ./
-COPY package.json pnpm-lock.yaml* ./
-COPY turbo.json ./
-COPY apps/api ./apps/api
-COPY packages/shared ./packages/shared
-
-# Install ALL dependencies (including dev for build)
 RUN pnpm install --frozen-lockfile
 
-# Build the API
-RUN pnpm build:api
+# Basic Auth username the UI pairs with its password field. Baked into the
+# frontend at build time; override with: docker build --build-arg NEXT_PUBLIC_API_USER=...
+ARG NEXT_PUBLIC_API_USER=api
+ENV NEXT_PUBLIC_API_USER=$NEXT_PUBLIC_API_USER
+
+# Builds apps/web (Next standalone output) and apps/api (tsc -> dist)
+RUN pnpm build
 
 # =============================================
-# Production stage - COMPLETELY STANDALONE
-# No pnpm, no workspace, just node and the built files
+# Production stage
 # =============================================
-FROM node:20-alpine AS production
+FROM node:20-bullseye AS production
 
-# Install FFmpeg for video conversion
-RUN apk add --no-cache ffmpeg
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg nginx curl apache2-utils \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy only the compiled JavaScript
-COPY --from=builder /app/apps/api/dist ./dist
+# Next.js standalone server (self-contained node_modules)
+COPY --from=builder /app/apps/web/.next/standalone ./web
+COPY --from=builder /app/apps/web/.next/static ./web/apps/web/.next/static
+COPY --from=builder /app/apps/web/public ./web/apps/web/public
 
-# Install ONLY runtime dependencies directly with npm
-# This avoids all pnpm workspace issues
-RUN npm init -y && \
-    npm install --save \
-    cors@^2.8.5 \
-    express@^4.21.2 \
-    express-rate-limit@^8.2.1 \
-    multer@^1.4.5-lts.1 \
-    sanitize-filename@^1.6.3
+# Express API: compiled output + runtime-only dependencies
+COPY --from=builder /app/apps/api/dist ./api/dist
+WORKDIR /app/api
+RUN npm init -y \
+    && npm install --save \
+        cors@^2.8.5 \
+        express@^4.21.2 \
+        express-rate-limit@^8.2.1 \
+        multer@^1.4.5-lts.1 \
+        sanitize-filename@^1.6.3
 
-# Create temp directory for video processing
-RUN mkdir -p /tmp/screenrec
+# nginx config and entrypoint
+COPY deploy/nginx.conf /etc/nginx/nginx.conf
+COPY deploy/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh \
+    && mkdir -p /tmp/screenrec \
+    && touch /etc/nginx/.htpasswd
 
-# Expose API port
-EXPOSE 3001
+# Web (Next) 3000, API (Express) 3001, nginx 80
+ENV PORT=3001 \
+    NODE_ENV=production
+EXPOSE 80
 
-# Start the server
-CMD ["node", "dist/index.js"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s \
+    CMD curl -fsS http://127.0.0.1:3001/health || exit 1
+
+ENTRYPOINT ["/entrypoint.sh"]

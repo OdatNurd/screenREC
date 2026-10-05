@@ -79,10 +79,10 @@ export function useMediaStreams() {
     }
   }, [stopScreen, addTrackEndListener]);
 
-  const startCamera = useCallback(async () => {
+  const startCamera = useCallback(async (deviceId?: string | null) => {
     try {
       setError(null);
-      const constraints = getCameraCaptureConstraints();
+      const constraints = getCameraCaptureConstraints(deviceId);
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
 
       stopAllTracks(cameraStreamRef.current);
@@ -100,10 +100,10 @@ export function useMediaStreams() {
     }
   }, [stopCamera, addTrackEndListener]);
 
-  const startMic = useCallback(async () => {
+  const startMic = useCallback(async (deviceId?: string | null) => {
     try {
       setError(null);
-      const constraints = getMicrophoneCaptureConstraints();
+      const constraints = getMicrophoneCaptureConstraints(deviceId);
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
 
       stopAllTracks(audioStreamRef.current);
@@ -121,19 +121,19 @@ export function useMediaStreams() {
     }
   }, [stopMic, addTrackEndListener]);
 
-  const toggleCamera = useCallback(async () => {
+  const toggleCamera = useCallback(async (deviceId?: string | null) => {
     if (cameraStreamRef.current) {
       stopCamera();
     } else {
-      await startCamera();
+      await startCamera(deviceId);
     }
   }, [stopCamera, startCamera]);
 
-  const toggleMic = useCallback(async () => {
+  const toggleMic = useCallback(async (deviceId?: string | null) => {
     if (isMicOn) {
       stopMic();
     } else {
-      await startMic();
+      await startMic(deviceId);
     }
   }, [isMicOn, stopMic, startMic]);
 

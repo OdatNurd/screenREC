@@ -11,10 +11,10 @@ build/
 # Turbo
 .turbo/
 
-# Environment
+# Environment (secrets) - .env.template stays tracked
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.template
 
 # IDE
 .idea/

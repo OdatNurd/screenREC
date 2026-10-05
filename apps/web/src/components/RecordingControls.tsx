@@ -1,6 +1,6 @@
 'use client';
 
-import { Camera, CameraOff, Monitor, Mic, MicOff, Square, Circle, Pause, Play } from 'lucide-react';
+import { Camera, CameraOff, Monitor, MonitorOff, Mic, MicOff, Square, Circle, Pause, Play } from 'lucide-react';
 import LayoutSelector from './LayoutSelector';
 import { RecordingLayout } from '@/types/layout';
 
@@ -66,13 +66,13 @@ export default function RecordingControls({
 
   return (
     <div className="w-full flex justify-center" role="toolbar" aria-label="Recording controls">
-      <div className="flex flex-wrap items-center justify-center gap-2 sm:gap-3 px-3 sm:px-4 md:px-6 py-2.5 sm:py-3 bg-white rounded-xl shadow-sm border border-gray-200 max-w-full">
+      <div className="flex flex-wrap items-center justify-center gap-2 sm:gap-3 px-3 sm:px-4 md:px-6 py-2.5 sm:py-3 bg-gray-800 rounded-xl shadow-sm border border-gray-700 max-w-full">
         <button
           onClick={onToggleMic}
           disabled={isRecording}
           className={`flex items-center justify-center w-10 h-10 sm:w-12 sm:h-12 rounded-full transition-all disabled:opacity-50 disabled:cursor-not-allowed ${isMicActive
-            ? 'bg-gray-100 text-gray-700 hover:bg-gray-200 disabled:hover:bg-gray-100'
-            : 'bg-red-50 text-red-600 hover:bg-red-100 disabled:hover:bg-red-50'
+            ? 'bg-green-900/50 text-green-400 hover:bg-green-900/70 disabled:hover:bg-green-900/50'
+            : 'bg-red-900/40 text-red-400 hover:bg-red-900/60 disabled:hover:bg-red-900/40'
             }`}
           aria-label={isMicActive ? 'Mute microphone' : 'Unmute microphone'}
           aria-pressed={isMicActive}
@@ -86,8 +86,8 @@ export default function RecordingControls({
           onClick={handleCameraToggle}
           disabled={isRecording}
           className={`flex items-center justify-center w-10 h-10 sm:w-12 sm:h-12 rounded-full transition-all disabled:opacity-50 disabled:cursor-not-allowed ${isCameraActive
-            ? 'bg-gray-100 text-gray-700 hover:bg-gray-200 disabled:hover:bg-gray-100'
-            : 'bg-red-50 text-red-600 hover:bg-red-100 disabled:hover:bg-red-50'
+            ? 'bg-green-900/50 text-green-400 hover:bg-green-900/70 disabled:hover:bg-green-900/50'
+            : 'bg-red-900/40 text-red-400 hover:bg-red-900/60 disabled:hover:bg-red-900/40'
             }`}
           aria-label={isCameraActive ? 'Stop camera' : 'Start camera'}
           aria-pressed={isCameraActive}
@@ -103,18 +103,22 @@ export default function RecordingControls({
           onClick={handleScreenToggle}
           disabled={isRecording}
           className={`flex items-center justify-center w-10 h-10 sm:w-12 sm:h-12 rounded-full transition-all disabled:opacity-50 disabled:cursor-not-allowed ${isScreenSharing
-            ? 'bg-blue-50 text-blue-600 hover:bg-blue-100 disabled:hover:bg-blue-50'
-            : 'bg-gray-50 text-gray-600 hover:bg-gray-100 disabled:hover:bg-gray-50'
+            ? 'bg-green-900/50 text-green-400 hover:bg-green-900/70 disabled:hover:bg-green-900/50'
+            : 'bg-red-900/40 text-red-400 hover:bg-red-900/60 disabled:hover:bg-red-900/40'
             }`}
           aria-label={isScreenSharing ? 'Stop sharing' : 'Share screen'}
           aria-pressed={isScreenSharing}
         >
-          <Monitor className="w-4 h-4 sm:w-5 sm:h-5" />
+          {isScreenSharing ? (
+            <Monitor className="w-4 h-4 sm:w-5 sm:h-5" />
+          ) : (
+            <MonitorOff className="w-4 h-4 sm:w-5 sm:h-5" />
+          )}
         </button>
 
         {onLayoutChange && (
           <>
-            <div className="hidden sm:block w-px h-6 sm:h-8 bg-gray-200 mx-0.5 sm:mx-1" />
+            <div className="hidden sm:block w-px h-6 sm:h-8 bg-gray-700 mx-0.5 sm:mx-1" />
             <div
               className="relative group"
               title={!isScreenSharing || !isCameraActive ? "Enable both screen share and camera to change layout" : undefined}
@@ -134,7 +138,7 @@ export default function RecordingControls({
           </>
         )}
 
-        <div className="hidden sm:block w-px h-6 sm:h-8 bg-gray-200 mx-0.5 sm:mx-1" />
+        <div className="hidden sm:block w-px h-6 sm:h-8 bg-gray-700 mx-0.5 sm:mx-1" />
 
         {!isRecording ? (
           <button
@@ -151,7 +155,7 @@ export default function RecordingControls({
           <div className="flex items-center gap-2">
             <button
               onClick={onPauseRecording}
-              className="flex items-center justify-center w-10 h-10 sm:w-12 sm:h-12 rounded-full bg-gray-100 text-gray-700 hover:bg-gray-200 transition-all"
+              className="flex items-center justify-center w-10 h-10 sm:w-12 sm:h-12 rounded-full bg-gray-700 text-gray-200 hover:bg-gray-600 transition-all"
               aria-label={isPaused ? 'Resume' : 'Pause'}
             >
               {isPaused ? <Play className="w-4 h-4 sm:w-5 sm:h-5" /> : <Pause className="w-4 h-4 sm:w-5 sm:h-5" />}

@@ -34,8 +34,8 @@ export default function LayoutSelector({ selectedLayout, onLayoutChange, disable
         disabled={disabled}
         className={`flex items-center justify-center w-12 h-12 rounded-full transition-all ${
           disabled
-            ? 'bg-gray-50 text-gray-300 cursor-not-allowed'
-            : 'bg-gray-50 text-gray-600 hover:bg-gray-100'
+            ? 'bg-gray-700/50 text-gray-500 cursor-not-allowed'
+            : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
         }`}
         aria-label="Select layout"
       >
@@ -43,10 +43,10 @@ export default function LayoutSelector({ selectedLayout, onLayoutChange, disable
       </button>
 
       {isOpen && (
-        <div className="absolute bottom-full mb-2 left-1/2 -translate-x-1/2 w-64 bg-white rounded-xl shadow-xl border border-gray-200 overflow-hidden z-50">
-          <div className="p-3 border-b border-gray-100">
-            <h3 className="text-sm font-semibold text-gray-900">Layout</h3>
-            <p className="text-xs text-gray-500 mt-0.5">Choose your recording layout</p>
+        <div className="absolute bottom-full mb-2 left-1/2 -translate-x-1/2 w-64 bg-gray-800 rounded-xl shadow-xl border border-gray-700 overflow-hidden z-50">
+          <div className="p-3 border-b border-gray-700">
+            <h3 className="text-sm font-semibold text-gray-100">Layout</h3>
+            <p className="text-xs text-gray-400 mt-0.5">Choose your recording layout</p>
           </div>
           <div className="p-2">
             {LAYOUT_OPTIONS.map((layout) => (
@@ -56,28 +56,28 @@ export default function LayoutSelector({ selectedLayout, onLayoutChange, disable
                   onLayoutChange(layout.id);
                   setIsOpen(false);
                 }}
-                className={`w-full flex items-start gap-3 p-3 rounded-lg transition-all hover:bg-gray-50 ${
-                  selectedLayout === layout.id ? 'bg-blue-50' : ''
+                className={`w-full flex items-start gap-3 p-3 rounded-lg transition-all hover:bg-gray-700/60 ${
+                  selectedLayout === layout.id ? 'bg-blue-900/40' : ''
                 }`}
               >
                 <div className="flex-1 text-left">
                   <div className="flex items-center gap-2">
-                    <span className="text-sm font-medium text-gray-900">{layout.name}</span>
+                    <span className="text-sm font-medium text-gray-100">{layout.name}</span>
                     {selectedLayout === layout.id && (
                       <Check className="w-4 h-4 text-blue-600" />
                     )}
                   </div>
-                  <p className="text-xs text-gray-500 mt-0.5">{layout.description}</p>
+                  <p className="text-xs text-gray-400 mt-0.5">{layout.description}</p>
                 </div>
-                <div className="w-12 h-12 bg-gray-100 rounded flex items-center justify-center flex-shrink-0">
+                <div className="w-12 h-12 bg-gray-700 rounded flex items-center justify-center flex-shrink-0">
                   {layout.id === 'pip' && (
-                    <div className="relative w-10 h-8 bg-gray-300 rounded">
-                      <div className="absolute bottom-1 right-1 w-3 h-3 bg-gray-600 rounded"></div>
+                    <div className="relative w-10 h-8 bg-gray-500 rounded">
+                      <div className="absolute bottom-1 right-1 w-3 h-3 bg-gray-300 rounded"></div>
                     </div>
                   )}
                   {layout.id === 'circle' && (
-                    <div className="relative w-10 h-8 bg-gray-300 rounded">
-                      <div className="absolute bottom-1 right-1 w-3 h-3 bg-gray-600 rounded-full"></div>
+                    <div className="relative w-10 h-8 bg-gray-500 rounded">
+                      <div className="absolute bottom-1 right-1 w-3 h-3 bg-gray-300 rounded-full"></div>
                     </div>
                   )}
                 </div>

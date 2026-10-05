@@ -168,7 +168,7 @@ export default function MinimalVideoPlayer({ src, onLoadedMetadata }: MinimalVid
     const progress = duration > 0 ? (currentTime / duration) * 100 : 0;
 
     return (
-        <div className="relative w-full aspect-video bg-black rounded-xl sm:rounded-2xl overflow-hidden group shadow-xl border border-gray-200">
+        <div className="relative w-full aspect-video bg-black rounded-xl sm:rounded-2xl overflow-hidden group shadow-xl border border-gray-700">
             <div
                 className="absolute inset-0 cursor-pointer z-10"
                 onClick={togglePlay}

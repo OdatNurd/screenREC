@@ -15,6 +15,8 @@ interface VideoPreviewProps {
   cameraPositionClasses: string;
   isDragging: boolean;
   selectedLayout: RecordingLayout;
+  /** Mirror the live preview (self-view). The recorded output is never mirrored. */
+  mirrorPreview: boolean;
   onShareScreen: () => void;
   onStartCamera: () => void;
   onStopCamera: () => void;
@@ -34,6 +36,7 @@ const VideoPreview = forwardRef<HTMLDivElement, VideoPreviewProps>(
       cameraPositionClasses,
       isDragging,
       selectedLayout,
+      mirrorPreview,
       onShareScreen,
       onStartCamera,
       onStopCamera,
@@ -60,7 +63,7 @@ const VideoPreview = forwardRef<HTMLDivElement, VideoPreviewProps>(
               autoPlay
               playsInline
               muted
-              className="w-full h-full object-cover pointer-events-none [transform:scaleX(-1)]"
+              className={`w-full h-full object-cover pointer-events-none ${mirrorPreview ? '[transform:scaleX(-1)]' : ''}`}
             />
             <button
               onClick={onStopCamera}
@@ -84,7 +87,7 @@ const VideoPreview = forwardRef<HTMLDivElement, VideoPreviewProps>(
             autoPlay
             playsInline
             muted
-            className="w-full h-full object-cover pointer-events-none [transform:scaleX(-1)]"
+            className={`w-full h-full object-cover pointer-events-none ${mirrorPreview ? '[transform:scaleX(-1)]' : ''}`}
           />
           <button
             onClick={onStopCamera}
@@ -95,7 +98,7 @@ const VideoPreview = forwardRef<HTMLDivElement, VideoPreviewProps>(
           </button>
         </div>
       );
-    }, [selectedLayout, cameraPositionClasses, isDragging, onCameraDragStart, cameraVideoRef, onStopCamera]);
+    }, [selectedLayout, cameraPositionClasses, isDragging, mirrorPreview, onCameraDragStart, cameraVideoRef, onStopCamera]);
 
     return (
       <div
@@ -123,7 +126,7 @@ const VideoPreview = forwardRef<HTMLDivElement, VideoPreviewProps>(
                 autoPlay
                 playsInline
                 muted
-                className="w-full h-full object-contain [transform:scaleX(-1)]"
+                className={`w-full h-full object-contain ${mirrorPreview ? '[transform:scaleX(-1)]' : ''}`}
               />
             )}
             {isScreenShared && isCameraOn && renderCameraOverlay}
