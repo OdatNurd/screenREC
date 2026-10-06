@@ -21,11 +21,11 @@ else
 fi
 
 echo "[entrypoint] starting web server (port 3000)..."
-node /app/web/apps/web/server.js &
+PORT=3000 HOSTNAME="0.0.0.0" node /app/web/apps/web/server.js &
 WEB_PID=$!
 
 echo "[entrypoint] starting api server (port 3001)..."
-node /app/api/dist/index.js &
+PORT=3001 node /app/api/dist/index.js &
 API_PID=$!
 
 echo "[entrypoint] starting nginx (port 80)..."

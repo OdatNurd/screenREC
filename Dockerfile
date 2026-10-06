@@ -37,7 +37,10 @@ RUN pnpm build
 # =============================================
 FROM node:20-bullseye AS production
 
-RUN apt-get update \
+# Redirect apt to the Debian Archives to bypass 404s on EOL Bullseye
+RUN echo "deb http://archive.debian.org/debian bullseye main" > /etc/apt/sources.list \
+    && echo "deb http://archive.debian.org/debian-security bullseye-security main" >> /etc/apt/sources.list \
+    && apt-get update -o Acquire::Check-Valid-Until=false \
     && apt-get install -y --no-install-recommends ffmpeg nginx curl apache2-utils \
     && rm -rf /var/lib/apt/lists/*
 
