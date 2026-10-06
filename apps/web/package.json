@@ -10,8 +10,6 @@
         "type-check": "tsc --noEmit"
     },
     "dependencies": {
-        "@ffmpeg/ffmpeg": "^0.12.15",
-        "@ffmpeg/util": "^0.12.2",
         "@screenrec/shared": "workspace:*",
         "@tailwindcss/postcss": "^4",
         "@types/node": "^20",

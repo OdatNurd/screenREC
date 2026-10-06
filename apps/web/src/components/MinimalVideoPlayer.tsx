@@ -1,14 +1,34 @@
 'use client';
 
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { Play, Pause } from 'lucide-react';
+import Image from 'next/image';
+import {
+    previewDurationMs,
+    toOutputMs,
+    toSourceMs,
+    type PreviewSegment,
+} from '@/utils/webmEdit';
+
+/** WYSIWYG edit preview: playback follows the EDL (skips cuts, holds cards). */
+export interface PlayerPreview {
+    segments: PreviewSegment[];
+    /** Pre-rendered title-card images keyed by card id (data URLs). */
+    cardImages: Record<string, string>;
+}
 
 interface MinimalVideoPlayerProps {
     src: string;
     onLoadedMetadata?: (duration: number) => void;
+    /** Hands the underlying <video> element to the parent (edit timeline seeks). */
+    onVideoElement?: (el: HTMLVideoElement | null) => void;
+    /** Playhead position for the edit timeline (source ms). */
+    onTimeUpdate?: (timeMs: number) => void;
+    /** When set, the player shows edited time and plays back the edited cut. */
+    preview?: PlayerPreview | null;
 }
 
-export default function MinimalVideoPlayer({ src, onLoadedMetadata }: MinimalVideoPlayerProps) {
+export default function MinimalVideoPlayer({ src, onLoadedMetadata, onVideoElement, onTimeUpdate, preview }: MinimalVideoPlayerProps) {
     const videoRef = useRef<HTMLVideoElement>(null);
     const progressRef = useRef<HTMLDivElement>(null);
 
@@ -18,12 +38,40 @@ export default function MinimalVideoPlayer({ src, onLoadedMetadata }: MinimalVid
     const [isDragging, setIsDragging] = useState(false);
     const [isReady, setIsReady] = useState(false);
 
+    // Edit-preview state: the card currently held on screen + its elapsed time.
+    const [activeCard, setActiveCard] = useState<PreviewSegment | null>(null);
+    const [cardElapsedMs, setCardElapsedMs] = useState(0);
+    const activeCardRef = useRef<PreviewSegment | null>(null);
+    const cardStartRef = useRef(0);
+    const resumeTimerRef = useRef<number | null>(null);
+    const consumedCardsRef = useRef<Set<string>>(new Set());
+
     const formatTime = (time: number) => {
         if (!isFinite(time) || isNaN(time)) return '0:00';
         const mins = Math.floor(time / 60);
         const secs = Math.floor(time % 60);
         return `${mins}:${secs.toString().padStart(2, '0')}`;
     };
+
+    const previewDurMs = useMemo(() => (preview ? previewDurationMs(preview.segments) : 0), [preview]);
+
+    // What the clock and progress bar show: edited (output) time when a
+    // preview is active, the raw source time otherwise.
+    const displayDurationSec = preview ? previewDurMs / 1000 : duration;
+    const displayCurrentSec = activeCard
+        ? (activeCard.outMs + Math.min(cardElapsedMs, activeCard.durationMs)) / 1000
+        : preview
+            ? toOutputMs(preview.segments, currentTime * 1000) / 1000
+            : currentTime;
+
+    const seekToOutputSec = useCallback((outSec: number) => {
+        const video = videoRef.current;
+        if (!video) return;
+        const clamped = Math.max(0, Math.min(outSec, displayDurationSec || outSec));
+        video.currentTime = preview
+            ? toSourceMs(preview.segments, clamped * 1000) / 1000
+            : clamped;
+    }, [preview, displayDurationSec]);
 
     const getSafeDuration = useCallback(() => {
         const video = videoRef.current;
@@ -36,6 +84,8 @@ export default function MinimalVideoPlayer({ src, onLoadedMetadata }: MinimalVid
     const togglePlay = useCallback(() => {
         const video = videoRef.current;
         if (!video) return;
+        // A title card is playing out its fixed duration - not user-driven.
+        if (activeCardRef.current) return;
 
         if (isPlaying) {
             video.pause();
@@ -92,12 +142,20 @@ export default function MinimalVideoPlayer({ src, onLoadedMetadata }: MinimalVid
     }, [src, onLoadedMetadata]);
 
     useEffect(() => {
+        onVideoElement?.(videoRef.current);
+        return () => onVideoElement?.(null);
+    }, [onVideoElement]);
+
+    useEffect(() => {
         const video = videoRef.current;
         if (!video) return;
 
         const handleTimeUpdate = () => {
             const time = video.currentTime;
-            if (isFinite(time)) setCurrentTime(time);
+            if (isFinite(time)) {
+                setCurrentTime(time);
+                onTimeUpdate?.(time * 1000);
+            }
         };
         const handleEnded = () => setIsPlaying(false);
         const handlePlay = () => setIsPlaying(true);
@@ -120,38 +178,121 @@ export default function MinimalVideoPlayer({ src, onLoadedMetadata }: MinimalVid
             video.removeEventListener('play', handlePlay);
             video.removeEventListener('pause', handlePause);
         };
-    }, [getSafeDuration]);
+    }, [getSafeDuration, onTimeUpdate]);
+
+    // ---- Edit preview supervision: skip removed regions, play title cards ----
+    useEffect(() => {
+        if (!preview) return;
+        const video = videoRef.current;
+        if (!video) return;
+
+        const dismissCard = () => {
+            if (resumeTimerRef.current !== null) {
+                window.clearTimeout(resumeTimerRef.current);
+                resumeTimerRef.current = null;
+            }
+            activeCardRef.current = null;
+            setActiveCard(null);
+        };
+
+        // A user seek replays cards behind the new position only when they
+        // are scrubbed past; cards ahead stay fresh and play when reached.
+        const handleSeeking = () => {
+            const t = (videoRef.current?.currentTime ?? 0) * 1000;
+            for (const s of preview.segments) {
+                if (s.kind !== 'card' || !s.card) continue;
+                if (t > s.fromMs + 100) consumedCardsRef.current.add(s.card.id);
+                else consumedCardsRef.current.delete(s.card.id);
+            }
+            if (activeCardRef.current) dismissCard();
+        };
+        video.addEventListener('seeking', handleSeeking);
+
+        const tick = window.setInterval(() => {
+            const v = videoRef.current;
+            if (!v) return;
+            const card = activeCardRef.current;
+            if (card) {
+                setCardElapsedMs(Math.min(performance.now() - cardStartRef.current, card.durationMs));
+                return;
+            }
+            if (v.paused) return;
+            const srcMs = v.currentTime * 1000;
+
+            // Title card: hold on the overlay for its duration, then resume
+            // at the insertion point (same content order as the export).
+            for (const s of preview.segments) {
+                if (
+                    s.kind === 'card' && s.card &&
+                    !consumedCardsRef.current.has(s.card.id) &&
+                    srcMs >= s.fromMs - 25 && srcMs < s.fromMs + 300
+                ) {
+                    consumedCardsRef.current.add(s.card.id);
+                    activeCardRef.current = s;
+                    cardStartRef.current = performance.now();
+                    setCardElapsedMs(0);
+                    setActiveCard(s);
+                    v.pause();
+                    resumeTimerRef.current = window.setTimeout(() => {
+                        dismissCard();
+                        videoRef.current?.play().catch(() => { });
+                    }, s.durationMs);
+                    return;
+                }
+            }
+
+            // Trimmed/cut regions do not exist in the edit: jump over them.
+            const inKept = preview.segments.some(
+                (s) => s.kind === 'source' && srcMs >= s.fromMs && srcMs < s.toMs
+            );
+            if (!inKept) {
+                const next = preview.segments.find((s) => s.kind === 'source' && s.fromMs > srcMs);
+                if (next) {
+                    v.currentTime = next.fromMs / 1000 + 0.001;
+                    return;
+                }
+                // Past the edited end: stop and rewind to the edited start.
+                v.pause();
+                const first = preview.segments.find((s) => s.kind === 'source');
+                if (first) v.currentTime = first.fromMs / 1000;
+            }
+        }, 60);
+
+        return () => {
+            window.clearInterval(tick);
+            video.removeEventListener('seeking', handleSeeking);
+            dismissCard();
+        };
+    }, [preview]);
 
     const handleProgressClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
-        const video = videoRef.current;
         const progressBar = progressRef.current;
-        if (!video || !progressBar || duration <= 0) return;
+        if (!progressBar || displayDurationSec <= 0) return;
 
         const rect = progressBar.getBoundingClientRect();
         const clickX = e.clientX - rect.left;
         const pct = clickX / rect.width;
-        const newTime = pct * duration;
+        const newTime = pct * displayDurationSec;
 
         if (isFinite(newTime) && newTime >= 0) {
-            video.currentTime = Math.max(0, Math.min(newTime, duration));
+            seekToOutputSec(newTime);
         }
-    }, [duration]);
+    }, [displayDurationSec, seekToOutputSec]);
 
     const handleProgressDrag = useCallback((e: MouseEvent) => {
-        if (!isDragging || duration <= 0) return;
-        const video = videoRef.current;
+        if (isDragging || displayDurationSec <= 0) return;
         const progressBar = progressRef.current;
-        if (!video || !progressBar) return;
+        if (!progressBar) return;
 
         const rect = progressBar.getBoundingClientRect();
         const dragX = e.clientX - rect.left;
         const pct = Math.max(0, Math.min(1, dragX / rect.width));
-        const newTime = pct * duration;
+        const newTime = pct * displayDurationSec;
 
         if (isFinite(newTime)) {
-            video.currentTime = newTime;
+            seekToOutputSec(newTime);
         }
-    }, [isDragging, duration]);
+    }, [isDragging, displayDurationSec, seekToOutputSec]);
 
     useEffect(() => {
         if (isDragging) {
@@ -165,7 +306,7 @@ export default function MinimalVideoPlayer({ src, onLoadedMetadata }: MinimalVid
         }
     }, [isDragging, handleProgressDrag]);
 
-    const progress = duration > 0 ? (currentTime / duration) * 100 : 0;
+    const progress = displayDurationSec > 0 ? (displayCurrentSec / displayDurationSec) * 100 : 0;
 
     return (
         <div className="relative w-full aspect-video bg-black rounded-xl sm:rounded-2xl overflow-hidden group shadow-xl border border-gray-700">
@@ -182,13 +323,34 @@ export default function MinimalVideoPlayer({ src, onLoadedMetadata }: MinimalVid
                 preload="auto"
             />
 
+            {activeCard && preview && (
+                <div className="absolute inset-0 z-20 bg-black" data-testid="card-preview-overlay">
+                    {preview.cardImages[activeCard.card?.id ?? ''] ? (
+                        <Image
+                            src={preview.cardImages[activeCard.card?.id ?? '']}
+                            alt={activeCard.card?.text ?? 'Title card'}
+                            fill
+                            unoptimized
+                            className="object-contain"
+                            draggable={false}
+                        />
+                    ) : (
+                        <div className="w-full h-full flex items-center justify-center">
+                            <span className="text-white text-xl font-semibold px-8 text-center">
+                                {activeCard.card?.text}
+                            </span>
+                        </div>
+                    )}
+                </div>
+            )}
+
             {!isReady && (
                 <div className="absolute inset-0 flex items-center justify-center bg-black/60 z-20">
                     <div className="w-8 h-8 sm:w-10 sm:h-10 border-4 border-white/30 border-t-white rounded-full animate-spin" />
                 </div>
             )}
 
-            {!isPlaying && isReady && (
+            {!isPlaying && isReady && !activeCard && (
                 <div
                     className="absolute inset-0 flex items-center justify-center z-10 cursor-pointer"
                     onClick={togglePlay}
@@ -204,7 +366,7 @@ export default function MinimalVideoPlayer({ src, onLoadedMetadata }: MinimalVid
                     ref={progressRef}
                     className="relative h-2 sm:h-1.5 bg-white/30 rounded-full cursor-pointer mb-2 sm:mb-3 group/progress pointer-events-auto"
                     onClick={handleProgressClick}
-                    onMouseDown={() => duration > 0 && setIsDragging(true)}
+                    onMouseDown={() => displayDurationSec > 0 && setIsDragging(true)}
                 >
                     <div
                         className="absolute top-0 left-0 h-full bg-indigo-500 rounded-full transition-all"
@@ -229,7 +391,7 @@ export default function MinimalVideoPlayer({ src, onLoadedMetadata }: MinimalVid
                     </button>
 
                     <span className="text-white text-xs sm:text-sm font-medium tabular-nums">
-                        {formatTime(currentTime)} / {formatTime(duration)}
+                        {formatTime(displayCurrentSec)} / {formatTime(displayDurationSec)}
                     </span>
                 </div>
             </div>

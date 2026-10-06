@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import RecordingControls from '@/components/RecordingControls';
 import Header from '@/components/Header';
 import VideoPreview from '@/components/VideoPreview';
@@ -10,6 +10,8 @@ import CountdownOverlay from '@/components/CountdownOverlay';
 import Notification from '@/components/Notification';
 import DownloadSettingsModal, { DownloadSettings } from '@/components/DownloadSettingsModal';
 import MediaSettings from '@/components/MediaSettings';
+import EditTimeline from '@/components/EditTimeline';
+import TitleCardModal from '@/components/TitleCardModal';
 import { useMediaStreams } from '@/hooks/useMediaStreams';
 import { useRecording } from '@/hooks/useRecording';
 import { useCameraPosition } from '@/hooks/useCameraPosition';
@@ -24,6 +26,20 @@ import {
   createWorkerCombinedStream,
   forceCleanupCombinedStreams,
 } from '@/utils/workerStreamCombiner';
+import {
+  indexRecording,
+  renderEdl,
+  estimateEditedBytes,
+  keptRanges,
+  reencodeSubGop,
+  generateTitleCard,
+  buildPreviewSegments,
+  grabFrame,
+  drawTitleCard,
+  type EdlState,
+  type IndexedRecording,
+  type TitleCardSpec,
+} from '@/utils/webmEdit';
 import { getResolutionDimensions, ResolutionPreset } from '@/config/recording';
 import { RecordingLayout } from '@/types/layout';
 
@@ -58,6 +74,62 @@ export default function RecordPage() {
   const [isConverting, setIsConverting] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
   const [conversionProgress, setConversionProgress] = useState(0);
+
+  // ---- Editing (trim / interior cuts / title cards) ----
+  const [editMode, setEditMode] = useState(false);
+  const [editIndex, setEditIndex] = useState<IndexedRecording | null>(null);
+  const [edl, setEdl] = useState<EdlState | null>(null);
+  const [edlPast, setEdlPast] = useState<EdlState[]>([]);
+  const [edlFuture, setEdlFuture] = useState<EdlState[]>([]);
+  const [cardModalAtMs, setCardModalAtMs] = useState<number | null>(null);
+  const [isRenderingEdit, setIsRenderingEdit] = useState(false);
+  const [playheadMs, setPlayheadMs] = useState(0);
+  const playerVideoRef = useRef<HTMLVideoElement | null>(null);
+
+  // Pre-rendered title-card images (frozen frame + text panel) for the
+  // WYSIWYG playback preview, keyed by card id.
+  const cardImagesRef = useRef<Map<string, string>>(new Map());
+  const [cardImages, setCardImages] = useState<Record<string, string>>({});
+
+  /** Output-time playback schedule mirroring the renderer's layout. */
+  const previewSchedule = useMemo(() => {
+    if (!editIndex || !edl) return null;
+    return buildPreviewSegments(editIndex, edl);
+  }, [editIndex, edl]);
+
+  // Stable identity matters: the player re-arms its playback supervisor when
+  // this object changes, and the page re-renders on every timeupdate.
+  const playerPreview = useMemo(
+    () => (previewSchedule ? { segments: previewSchedule, cardImages } : null),
+    [previewSchedule, cardImages]
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!editIndex || !edl) return;
+    (async () => {
+      for (const card of edl.cards) {
+        if (cardImagesRef.current.has(card.id)) continue;
+        try {
+          const frame = await grabFrame(editIndex, card.atMs);
+          const canvas = document.createElement('canvas');
+          canvas.width = editIndex.video?.width ?? 1280;
+          canvas.height = editIndex.video?.height ?? 720;
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            drawTitleCard(ctx, frame, card, canvas.width, canvas.height);
+            cardImagesRef.current.set(card.id, canvas.toDataURL('image/png'));
+          }
+          frame.close();
+        } catch {
+          // Preview falls back to a plain text overlay for this card.
+        }
+        if (cancelled) return;
+        setCardImages(Object.fromEntries(cardImagesRef.current));
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [editIndex, edl]);
 
   // Device selection
   const [cameraDeviceId, setCameraDeviceId] = useState('');
@@ -268,13 +340,19 @@ export default function RecordPage() {
     handleShareScreen();
   }, [isMobile, showNotification, handleShareScreen]);
 
-  const handleStartCamera = useCallback(() => {
-    return toggleCamera(cameraDeviceId || null);
-  }, [toggleCamera, cameraDeviceId]);
+  const handleStartCamera = useCallback(async () => {
+    await toggleCamera(cameraDeviceId || null);
+    // Camera permission is granted by the time the toggle resolves, which
+    // unredacts device labels/ids — re-enumerate so both pickers reflect the
+    // full device list without a page refresh.
+    refreshDevices();
+  }, [toggleCamera, cameraDeviceId, refreshDevices]);
 
-  const handleToggleMic = useCallback(() => {
-    return toggleMic(micDeviceId || null);
-  }, [toggleMic, micDeviceId]);
+  const handleToggleMic = useCallback(async () => {
+    await toggleMic(micDeviceId || null);
+    // Same as above: mic permission unredacts the device list — refresh it now.
+    refreshDevices();
+  }, [toggleMic, micDeviceId, refreshDevices]);
 
   const handleCameraDeviceChange = useCallback(async (deviceId: string) => {
     setCameraDeviceId(deviceId);
@@ -568,6 +646,94 @@ export default function RecordPage() {
     }, 500);
   }, [stopRecording, stopAllStreams]);
 
+  const updateEdl = useCallback((next: EdlState) => {
+    setEdlPast((past) => (edl ? [...past.slice(-49), edl] : past));
+    setEdlFuture([]);
+    setEdl(next);
+  }, [edl]);
+
+  const handleUndo = useCallback(() => {
+    if (edlPast.length === 0 || !edl) return;
+    const prev = edlPast[edlPast.length - 1];
+    setEdlPast(edlPast.slice(0, -1));
+    setEdlFuture([edl, ...edlFuture]);
+    setEdl(prev);
+  }, [edlPast, edl, edlFuture]);
+
+  const handleRedo = useCallback(() => {
+    if (edlFuture.length === 0 || !edl) return;
+    const next = edlFuture[0];
+    setEdlFuture(edlFuture.slice(1));
+    setEdlPast([...edlPast, edl]);
+    setEdl(next);
+  }, [edlFuture, edl, edlPast]);
+
+  const handleEditToggle = useCallback(async () => {
+    if (editMode) {
+      setEditMode(false);
+      setCardModalAtMs(null);
+      return;
+    }
+    if (!recordedBlob) return;
+    try {
+      const index = await indexRecording(recordedBlob);
+      if (!index.video) {
+        showNotification('This recording has no video track to edit', 'error');
+        return;
+      }
+      setEditIndex(index);
+      setEdl((prev) => prev ?? {
+        trimStartMs: 0,
+        trimEndMs: index.durationMs,
+        cuts: [],
+        cards: [],
+        snapToKeyframes: true,
+      });
+      setEditMode(true);
+    } catch (error) {
+      showNotification(
+        `Could not read recording for editing (${error instanceof Error ? error.message : 'unknown error'})`,
+        'error'
+      );
+    }
+  }, [editMode, recordedBlob, showNotification]);
+
+  const handleSeek = useCallback((ms: number) => {
+    const video = playerVideoRef.current;
+    if (video) {
+      video.currentTime = Math.max(0, ms / 1000);
+    }
+    setPlayheadMs(ms);
+  }, []);
+
+  const handleVideoElement = useCallback((el: HTMLVideoElement | null) => {
+    playerVideoRef.current = el;
+  }, []);
+
+  const handleAddCard = useCallback((atMs: number) => {
+    setCardModalAtMs(atMs);
+  }, []);
+
+  const handleCardConfirm = useCallback((spec: Omit<TitleCardSpec, 'id'>) => {
+    if (!edl) return;
+    updateEdl({ ...edl, cards: [...edl.cards, { ...spec, id: `card-${Date.now()}` }] });
+    setCardModalAtMs(null);
+  }, [edl, updateEdl]);
+
+  /** Output duration of the current EDL (kept source spans + title cards). */
+  const editedDurationMs = useMemo(() => {
+    if (!editIndex || !edl) return 0;
+    const kept = keptRanges(editIndex, edl).reduce((sum, r) => sum + (r.endMs - r.startMs), 0);
+    return kept + edl.cards.reduce((sum, c) => sum + c.durationMs, 0);
+  }, [editIndex, edl]);
+
+  const hasEdits = !!editIndex && !!edl && (
+    edl.trimStartMs > 0 ||
+    edl.trimEndMs < editIndex.durationMs - 1 ||
+    edl.cuts.length > 0 ||
+    edl.cards.length > 0
+  );
+
   const handleDownload = useCallback(() => {
     if (!recordedBlob) return;
     setShowDownloadModal(true);
@@ -577,12 +743,33 @@ export default function RecordPage() {
     if (!recordedBlob) return;
     setShowDownloadModal(false);
 
-    if (!(await isBlobReadable(recordedBlob))) {
+    // Non-destructive: edits render to a copy; the original stays untouched.
+    let sourceBlob = recordedBlob;
+    if (settings.source === 'edited' && editIndex && edl && hasEdits) {
+      setIsRenderingEdit(true);
+      try {
+        sourceBlob = await renderEdl(editIndex, edl, {
+          generateCard: (spec) => generateTitleCard(editIndex, spec),
+          reencodeSubGop: (fromMs, toMs) => reencodeSubGop(editIndex, fromMs, toMs),
+        });
+      } catch (error) {
+        showNotification(
+          `Could not apply edits (${error instanceof Error ? error.message : 'unknown error'}) — nothing was downloaded`,
+          'error'
+        );
+        return;
+      } finally {
+        setIsRenderingEdit(false);
+      }
+      showNotification('Edits applied', 'success');
+    }
+
+    if (!(await isBlobReadable(sourceBlob))) {
       showNotification('Recording file is missing from storage — nothing was downloaded. Please record again.', 'error');
       return;
     }
 
-    let blobToDownload = recordedBlob;
+    let blobToDownload = sourceBlob;
     let extension = 'webm';
 
     if (settings.format === 'mp4') {
@@ -590,7 +777,7 @@ export default function RecordPage() {
       setConversionProgress(0);
       showNotification('Converting to MP4 via server...', 'info');
       try {
-        const mp4Blob = await convertToMp4Api(recordedBlob, {
+        const mp4Blob = await convertToMp4Api(sourceBlob, {
           onProgress: setConversionProgress,
           password: settings.password,
         });
@@ -624,7 +811,7 @@ export default function RecordPage() {
     if (saved) {
       showNotification('Recording downloaded successfully', 'success');
     }
-  }, [recordedBlob, showNotification]);
+  }, [recordedBlob, editIndex, edl, hasEdits, showNotification]);
 
   const handleNewRecording = useCallback(() => {
     if (recordedVideoUrl) {
@@ -632,6 +819,13 @@ export default function RecordPage() {
     }
     setRecordedBlob(null);
     setRecordedVideoUrl(null);
+    setEditMode(false);
+    setEditIndex(null);
+    setEdl(null);
+    setEdlPast([]);
+    setEdlFuture([]);
+    setCardModalAtMs(null);
+    setPlayheadMs(0);
     // The UI has dropped the recording — release its storage (temp file)
     releaseStoredRecording();
   }, [recordedVideoUrl, releaseStoredRecording]);
@@ -666,7 +860,21 @@ export default function RecordPage() {
         onClose={() => setShowDownloadModal(false)}
         onDownload={handleDownloadConfirm}
         videoBlob={recordedBlob}
+        hasEdits={hasEdits}
+        editedDurationMs={editedDurationMs}
+        editedSizeBytes={editIndex && edl ? estimateEditedBytes(editIndex, edl) : 0}
+        originalDurationMs={editIndex?.durationMs ?? 0}
       />
+
+      {/* Title card editor */}
+      {cardModalAtMs !== null && editIndex && (
+        <TitleCardModal
+          index={editIndex}
+          atMs={cardModalAtMs}
+          onConfirm={handleCardConfirm}
+          onClose={() => setCardModalAtMs(null)}
+        />
+      )}
 
       <div className="fixed top-16 sm:top-20 left-1/2 -translate-x-1/2 z-50 h-20 px-4 w-full max-w-md">
         {notifications.slice().reverse().map((notification, index) => (
@@ -687,6 +895,17 @@ export default function RecordPage() {
           </div>
         ))}
       </div>
+
+      {/* Applying-edits overlay */}
+      {isRenderingEdit && (
+        <div className="fixed inset-0 z-40 bg-black/80 flex items-center justify-center p-4">
+          <div className="bg-gray-800 border border-gray-700 rounded-2xl p-6 sm:p-8 shadow-2xl flex flex-col items-center gap-3 sm:gap-4 max-w-sm w-full mx-4">
+            <div className="w-12 h-12 sm:w-16 sm:h-16 border-4 border-emerald-500/30 border-t-emerald-400 rounded-full animate-spin" />
+            <h3 className="text-lg sm:text-xl font-semibold text-gray-100">Applying edits</h3>
+            <p className="text-sm sm:text-base text-gray-400 text-center">Building your edited recording...</p>
+          </div>
+        </div>
+      )}
 
       {/* Converting Overlay */}
       {isConverting && (
@@ -720,9 +939,31 @@ export default function RecordPage() {
                   </div>
                 )}
                 {!isVideoLoading && recordedVideoUrl && (
-                  <MinimalVideoPlayer src={recordedVideoUrl} />
+                  <MinimalVideoPlayer
+                    src={recordedVideoUrl}
+                    onVideoElement={handleVideoElement}
+                    onTimeUpdate={setPlayheadMs}
+                    preview={playerPreview}
+                  />
                 )}
               </div>
+
+              {/* Edit surface */}
+              {editMode && editIndex && edl && (
+                <EditTimeline
+                  index={editIndex}
+                  edl={edl}
+                  playheadMs={playheadMs}
+                  canUndo={edlPast.length > 0}
+                  canRedo={edlFuture.length > 0}
+                  onChange={updateEdl}
+                  onSeek={handleSeek}
+                  onAddCard={handleAddCard}
+                  onUndo={handleUndo}
+                  onRedo={handleRedo}
+                  onDone={() => setEditMode(false)}
+                />
+              )}
 
               {/* Controls - Bottom */}
               <PlaybackControls
@@ -732,6 +973,9 @@ export default function RecordPage() {
                 resolution={recordingMeta}
                 storageBackend={storageBackend}
                 storageDegraded={storageDegraded}
+                onEdit={handleEditToggle}
+                editActive={editMode}
+                hasEdits={hasEdits}
               />
             </div>
           ) : (

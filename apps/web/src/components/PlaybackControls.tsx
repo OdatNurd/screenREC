@@ -1,6 +1,6 @@
 'use client';
 
-import { Download, RotateCcw } from 'lucide-react';
+import { Download, RotateCcw, Scissors, Check } from 'lucide-react';
 import StorageIndicator from './StorageIndicator';
 import { StorageBackend } from '@/utils/recordingStorage';
 import { useCallback } from 'react';
@@ -16,6 +16,12 @@ interface PlaybackControlsProps {
   storageBackend?: StorageBackend | null;
   /** True only when disk was forced and the recording actually fell back to RAM. */
   storageDegraded?: boolean;
+  /** Enter/leave edit mode for this recording. */
+  onEdit?: () => void;
+  /** Whether edit mode is currently active. */
+  editActive?: boolean;
+  /** Whether any trims/cuts/cards are currently applied. */
+  hasEdits?: boolean;
 }
 
 export default function PlaybackControls({
@@ -25,7 +31,10 @@ export default function PlaybackControls({
   recordingName,
   resolution,
   storageBackend,
-  storageDegraded
+  storageDegraded,
+  onEdit,
+  editActive,
+  hasEdits
 }: PlaybackControlsProps) {
   const formatFileSize = useCallback((bytes: number) => {
     if (bytes < 1024) return `${bytes} B`;
@@ -62,6 +71,22 @@ export default function PlaybackControls({
         </div>
 
         <div className="flex items-center gap-2 w-full sm:w-auto">
+          {onEdit && (
+            <button
+              onClick={onEdit}
+              data-testid="edit-button"
+              className={`flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium transition ${editActive
+                ? 'bg-indigo-600 hover:bg-indigo-700 text-white'
+                : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
+                }`}
+            >
+              {editActive ? <Check size={14} /> : <Scissors size={14} />}
+              {editActive ? 'Done editing' : 'Edit'}
+              {!editActive && hasEdits && (
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" title="Edits applied" />
+              )}
+            </button>
+          )}
           <button
             onClick={onNewRecording}
             className="flex items-center justify-center gap-1.5 px-3 py-2 bg-gray-700 hover:bg-gray-600 text-gray-200 rounded-lg text-sm font-medium transition"
