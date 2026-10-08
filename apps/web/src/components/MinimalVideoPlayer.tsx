@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
-import { Play, Pause } from 'lucide-react';
+import { Play, Pause, Volume2, VolumeX } from 'lucide-react';
 import Image from 'next/image';
 import {
     previewDurationMs,
@@ -9,6 +9,9 @@ import {
     toSourceMs,
     type PreviewSegment,
 } from '@/utils/webmEdit';
+import { RECORDING_CONFIG } from '@/config/recording';
+
+const VOLUME_STORAGE_KEY = 'screenrec-playback-volume';
 
 /** WYSIWYG edit preview: playback follows the EDL (skips cuts, holds cards). */
 export interface PlayerPreview {
@@ -37,6 +40,8 @@ export default function MinimalVideoPlayer({ src, onLoadedMetadata, onVideoEleme
     const [duration, setDuration] = useState(0);
     const [isDragging, setIsDragging] = useState(false);
     const [isReady, setIsReady] = useState(false);
+    // Playback loudness (not mic gain): 0..1, persisted across sessions.
+    const [volume, setVolume] = useState(1);
 
     // Edit-preview state: the card currently held on screen + its elapsed time.
     const [activeCard, setActiveCard] = useState<PreviewSegment | null>(null);
@@ -46,12 +51,34 @@ export default function MinimalVideoPlayer({ src, onLoadedMetadata, onVideoEleme
     const resumeTimerRef = useRef<number | null>(null);
     const consumedCardsRef = useRef<Set<string>>(new Set());
 
-    const formatTime = (time: number) => {
-        if (!isFinite(time) || isNaN(time)) return '0:00';
-        const mins = Math.floor(time / 60);
-        const secs = Math.floor(time % 60);
-        return `${mins}:${secs.toString().padStart(2, '0')}`;
+    const formatTime = (timeSec: number) => {
+        if (!isFinite(timeSec) || isNaN(timeSec)) return '00:00:00';
+        // MM:SS:FF at the recording's frame rate (video-editor convention).
+        const fps = RECORDING_CONFIG.CANVAS.DEFAULT_FPS;
+        const totalFrames = Math.max(0, Math.round(timeSec * fps));
+        const pad = (n: number) => String(n).padStart(2, '0');
+        return `${pad(Math.floor(totalFrames / (fps * 60)))}:${pad(Math.floor(totalFrames / fps) % 60)}:${pad(totalFrames % fps)}`;
     };
+
+    // Restore the saved playback volume once on mount.
+    useEffect(() => {
+        try {
+            const saved = parseFloat(localStorage.getItem(VOLUME_STORAGE_KEY) ?? '');
+            if (isFinite(saved) && saved >= 0 && saved <= 1) setVolume(saved);
+        } catch { /* ignore */ }
+    }, []);
+
+    // Apply to the element only — persistence happens in the user handlers
+    // (writing here would clobber the saved value on mount/remount).
+    useEffect(() => {
+        const video = videoRef.current;
+        if (video) video.volume = volume;
+    }, [volume]);
+
+    const changeVolume = useCallback((v: number) => {
+        setVolume(v);
+        try { localStorage.setItem(VOLUME_STORAGE_KEY, String(v)); } catch { /* ignore */ }
+    }, []);
 
     const previewDurMs = useMemo(() => (preview ? previewDurationMs(preview.segments) : 0), [preview]);
 
@@ -280,7 +307,7 @@ export default function MinimalVideoPlayer({ src, onLoadedMetadata, onVideoEleme
     }, [displayDurationSec, seekToOutputSec]);
 
     const handleProgressDrag = useCallback((e: MouseEvent) => {
-        if (isDragging || displayDurationSec <= 0) return;
+        if (!isDragging || displayDurationSec <= 0) return;
         const progressBar = progressRef.current;
         if (!progressBar) return;
 
@@ -335,8 +362,24 @@ export default function MinimalVideoPlayer({ src, onLoadedMetadata, onVideoEleme
                             draggable={false}
                         />
                     ) : (
-                        <div className="w-full h-full flex items-center justify-center">
-                            <span className="text-white text-xl font-semibold px-8 text-center">
+                        /* Fallback when the pre-rendered card image is missing:
+                           draw the text in the card's box, not centered on black. */
+                        <div
+                            className="absolute flex items-center justify-center overflow-hidden"
+                            style={{
+                                left: `${(activeCard.card?.box.x ?? 0) * 100}%`,
+                                top: `${(activeCard.card?.box.y ?? 0) * 100}%`,
+                                width: `${(activeCard.card?.box.w ?? 1) * 100}%`,
+                                height: `${(activeCard.card?.box.h ?? 1) * 100}%`,
+                                backgroundColor: activeCard.card?.bgColor ?? 'rgba(17, 24, 39, 0.85)',
+                                borderRadius: '0.5rem',
+                            }}
+                            data-testid="card-preview-fallback-box"
+                        >
+                            <span
+                                className="text-xl font-semibold px-4 text-center"
+                                style={{ color: activeCard.card?.textColor ?? '#f9fafb' }}
+                            >
                                 {activeCard.card?.text}
                             </span>
                         </div>
@@ -393,6 +436,32 @@ export default function MinimalVideoPlayer({ src, onLoadedMetadata, onVideoEleme
                     <span className="text-white text-xs sm:text-sm font-medium tabular-nums">
                         {formatTime(displayCurrentSec)} / {formatTime(displayDurationSec)}
                     </span>
+
+                    <div className="flex items-center gap-1.5 sm:gap-2 pointer-events-auto" data-testid="volume-control">
+                        <button
+                            onClick={() => changeVolume(volume > 0 ? 0 : 1)}
+                            className="text-white/90 hover:text-white transition shrink-0"
+                            aria-label={volume > 0 ? 'Mute' : 'Unmute'}
+                            data-testid="volume-mute"
+                        >
+                            {volume > 0 ? (
+                                <Volume2 size={18} className="sm:w-5 sm:h-5" />
+                            ) : (
+                                <VolumeX size={18} className="sm:w-5 sm:h-5" />
+                            )}
+                        </button>
+                        <input
+                            type="range"
+                            min={0}
+                            max={1}
+                            step={0.05}
+                            value={volume}
+                            onChange={(e) => changeVolume(Number(e.target.value))}
+                            className="w-16 sm:w-24 h-1.5 accent-indigo-400 cursor-pointer"
+                            aria-label="Playback volume"
+                            data-testid="volume-slider"
+                        />
+                    </div>
                 </div>
             </div>
         </div>

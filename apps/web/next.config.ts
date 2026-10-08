@@ -1,7 +1,31 @@
 import path from "path";
+import { execSync } from "child_process";
 import type { NextConfig } from "next";
 
+/**
+ * Frozen copy of the commit this build was made from. NEXT_PUBLIC_* values are
+ * inlined into the client bundle at build time, so a deployed page shows what
+ * is running. Falls back to "dev" when git is unavailable (e.g. a container
+ * build without a .git directory); override with NEXT_PUBLIC_GIT_SHA.
+ */
+function buildGitSha(): string {
+  try {
+    return (
+      execSync("git rev-parse --short HEAD", {
+        stdio: ["ignore", "pipe", "ignore"],
+      })
+        .toString()
+        .trim() || "dev"
+    );
+  } catch {
+    return "dev";
+  }
+}
+
 const nextConfig: NextConfig = {
+  env: {
+    NEXT_PUBLIC_GIT_SHA: process.env.NEXT_PUBLIC_GIT_SHA || buildGitSha(),
+  },
   // Self-contained server bundle for the Docker image
   output: "standalone",
   experimental: {

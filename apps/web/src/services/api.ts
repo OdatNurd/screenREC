@@ -13,7 +13,13 @@ const API_URL = rawApiUrl.startsWith('http')
 export const API_USER = process.env.NEXT_PUBLIC_API_USER || 'api';
 
 export interface ConvertOptions {
+    /** Real, measured upload progress: 0-100 of the request body. */
     onProgress?: (progress: number) => void;
+    /**
+     * Phase switch: 'uploading' (measured via onProgress) → 'converting'
+     * (server-side work, which is not measurable from the browser).
+     */
+    onPhase?: (phase: 'uploading' | 'converting') => void;
     /** Password paired with API_USER for HTTP Basic Auth. */
     password?: string;
 }
@@ -39,30 +45,41 @@ function basicAuthHeader(user: string, password: string): string {
 /**
  * Convert video blob to MP4 using the backend API.
  * Sends the Basic Auth credentials typed into the UI (validated by the reverse
- * proxies). Uses XHR so upload progress is real (fetch has none): progress 5-70
- * while uploading, then 70-100 covers server-side conversion.
+ * proxies). Uses XHR so upload progress is real (fetch has none): onProgress
+ * reports measured upload bytes (0-100); once the body is fully uploaded the
+ * server converts unmeasured — signalled via onPhase('converting') so the UI
+ * never fakes progress for that stretch.
  */
 export async function convertToMp4(
     videoBlob: Blob,
     options?: ConvertOptions
-): Promise<Blob | null> {
+): Promise<Blob> {
     const formData = new FormData();
     formData.append('video', videoBlob, 'recording.webm');
 
-    options?.onProgress?.(5);
+    options?.onPhase?.('uploading');
+    options?.onProgress?.(0);
 
-    return new Promise<Blob | null>((resolve, reject) => {
+    return new Promise<Blob>((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         xhr.open('POST', `${API_URL}/api/convert`);
         if (options?.password) {
             xhr.setRequestHeader('Authorization', basicAuthHeader(API_USER, options.password));
         }
         xhr.responseType = 'blob';
+        // The server-side ffmpeg run is capped at 8 minutes and nginx waits up
+        // to 600s; the client gives up last (12 min) and fails loudly instead
+        // of hanging forever.
+        xhr.timeout = 12 * 60 * 1000;
 
         xhr.upload.onprogress = (e) => {
             if (e.lengthComputable) {
-                options?.onProgress?.(5 + Math.round((e.loaded / e.total) * 65));
+                options?.onProgress?.(Math.round((e.loaded / e.total) * 100));
             }
+        };
+        xhr.upload.onload = () => {
+            // Whole body received; the server-side conversion is unmeasured.
+            options?.onPhase?.('converting');
         };
 
         xhr.onload = () => {
@@ -90,7 +107,7 @@ export async function convertToMp4(
         };
 
         xhr.onerror = () => reject(new ApiUnreachableError('network error'));
-        xhr.ontimeout = () => reject(new ApiUnreachableError('timed out'));
+        xhr.ontimeout = () => reject(new ApiUnreachableError('timed out after 12 minutes'));
 
         xhr.send(formData);
     });

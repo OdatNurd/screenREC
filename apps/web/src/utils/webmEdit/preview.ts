@@ -88,7 +88,12 @@ export function toOutputMs(segments: PreviewSegment[], sourceMs: number): number
 export function toSourceMs(segments: PreviewSegment[], outMs: number): number {
   if (segments.length === 0) return outMs;
   for (const s of segments) {
-    if (outMs >= s.outMs && outMs < s.outMs + s.durationMs) return s.fromMs;
+    if (outMs >= s.outMs && outMs < s.outMs + s.durationMs) {
+      // Source segments carry their offset within the segment; a card span
+      // maps back to its insertion point. (Returning bare fromMs here made
+      // every seek jump to the segment start.)
+      return s.kind === 'card' ? s.fromMs : s.fromMs + (outMs - s.outMs);
+    }
   }
   const last = segments[segments.length - 1];
   return outMs <= segments[0].outMs ? segments[0].fromMs : last.toMs;

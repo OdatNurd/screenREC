@@ -8,6 +8,7 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { RECORDING_CONFIG } from '@/config/recording';
 import {
   Check,
   Scissors,
@@ -39,10 +40,11 @@ interface DragState {
 }
 
 function fmt(ms: number): string {
-  const total = Math.max(0, ms) / 1000;
-  const m = Math.floor(total / 60);
-  const s = (total % 60).toFixed(1).padStart(4, '0');
-  return `${m}:${s}`;
+  // MM:SS:FF at the recording's frame rate (video-editor convention).
+  const fps = RECORDING_CONFIG.CANVAS.DEFAULT_FPS;
+  const totalFrames = Math.max(0, Math.round((ms / 1000) * fps));
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${pad(Math.floor(totalFrames / (fps * 60)))}:${pad(Math.floor(totalFrames / fps) % 60)}:${pad(totalFrames % fps)}`;
 }
 
 export default function EditTimeline({
@@ -258,7 +260,7 @@ export default function EditTimeline({
             <button
               onMouseDown={(e) => e.stopPropagation()}
               onClick={(e) => { e.stopPropagation(); removeCut(cut.id); }}
-              className="absolute -top-2 -right-2 w-5 h-5 bg-red-500 hover:bg-red-400 rounded-full flex items-center justify-center"
+              className="absolute -top-2 -right-2 z-20 w-5 h-5 bg-red-500 hover:bg-red-400 rounded-full flex items-center justify-center"
               title="Restore this section"
             >
               <X size={11} className="text-white" />
@@ -355,6 +357,13 @@ export default function EditTimeline({
             {dragHint.snapped ? `Snapped to keyframe · ${fmt(dragHint.ms)}` : `Frame-accurate · ${fmt(dragHint.ms)}`}
           </div>
         )}
+      </div>
+
+      {/* In/out readout: exact handle positions and the span between them */}
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mt-2 text-[11px] font-mono tabular-nums text-gray-400" data-testid="trim-readout">
+        <span>In <span className="text-gray-100">{fmt(edl.trimStartMs)}</span></span>
+        <span>Out <span className="text-gray-100">{fmt(edl.trimEndMs)}</span></span>
+        <span>Length <span className="text-gray-100">{fmt(edl.trimEndMs - edl.trimStartMs)}</span></span>
       </div>
 
       {/* Action bar */}

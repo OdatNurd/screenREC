@@ -20,6 +20,8 @@ interface PlaybackControlsProps {
   onEdit?: () => void;
   /** Whether edit mode is currently active. */
   editActive?: boolean;
+  /** True while the edit list is being built (Edit button shows a spinner). */
+  editBusy?: boolean;
   /** Whether any trims/cuts/cards are currently applied. */
   hasEdits?: boolean;
 }
@@ -34,6 +36,7 @@ export default function PlaybackControls({
   storageDegraded,
   onEdit,
   editActive,
+  editBusy = false,
   hasEdits
 }: PlaybackControlsProps) {
   const formatFileSize = useCallback((bytes: number) => {
@@ -74,15 +77,22 @@ export default function PlaybackControls({
           {onEdit && (
             <button
               onClick={onEdit}
+              disabled={editBusy}
               data-testid="edit-button"
-              className={`flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium transition ${editActive
+              className={`flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium transition disabled:opacity-70 disabled:cursor-wait ${editActive
                 ? 'bg-indigo-600 hover:bg-indigo-700 text-white'
                 : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
                 }`}
             >
-              {editActive ? <Check size={14} /> : <Scissors size={14} />}
-              {editActive ? 'Done editing' : 'Edit'}
-              {!editActive && hasEdits && (
+              {editBusy ? (
+                <span className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" data-testid="edit-spinner" />
+              ) : editActive ? (
+                <Check size={14} />
+              ) : (
+                <Scissors size={14} />
+              )}
+              {editBusy ? 'Building edit list…' : editActive ? 'Done editing' : 'Edit'}
+              {!editActive && !editBusy && hasEdits && (
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" title="Edits applied" />
               )}
             </button>

@@ -30,23 +30,30 @@ export default function TitleCardModal({ index, atMs, onConfirm, onClose }: Titl
   const [box, setBox] = useState({ x: 0.15, y: 0.62, w: 0.7, h: 0.22 });
   const [frameError, setFrameError] = useState<string | null>(null);
   const [frameReady, setFrameReady] = useState(false);
+  // Bumped by the Retry button to re-run a failed frame capture.
+  const [captureAttempt, setCaptureAttempt] = useState(0);
 
-  // Capture the frame at the insertion point once.
+  // Capture the frame at the insertion point once per attempt.
   useEffect(() => {
     let cancelled = false;
+    setFrameReady(false);
+    setFrameError(null);
     grabFrame(index, atMs)
       .then((frame) => {
         if (cancelled) { frame.close(); return; }
         frameRef.current = frame;
         setFrameReady(true);
       })
-      .catch((e) => setFrameError(e instanceof Error ? e.message : 'Could not capture frame'));
+      .catch((e) => {
+        if (cancelled) return;
+        setFrameError(e instanceof Error ? e.message : 'Could not capture frame');
+      });
     return () => {
       cancelled = true;
       frameRef.current?.close();
       frameRef.current = null;
     };
-  }, [index, atMs]);
+  }, [index, atMs, captureAttempt]);
 
   // Redraw the preview whenever anything changes.
   useEffect(() => {
@@ -135,8 +142,15 @@ export default function TitleCardModal({ index, atMs, onConfirm, onClose }: Titl
         {/* Preview: captured frame + draggable text box */}
         <div className="relative rounded-xl overflow-hidden border border-gray-700 bg-black">
           {frameError ? (
-            <div className="w-full aspect-video flex items-center justify-center text-sm text-red-400">
-              {frameError}
+            <div className="w-full aspect-video flex flex-col items-center justify-center gap-3 px-8">
+              <p className="text-sm text-red-400 text-center" data-testid="card-frame-error">{frameError}</p>
+              <button
+                onClick={() => setCaptureAttempt((n) => n + 1)}
+                className="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-gray-100 rounded-lg text-sm font-medium transition"
+                data-testid="card-frame-retry"
+              >
+                Retry frame capture
+              </button>
             </div>
           ) : (
             <div className="relative">

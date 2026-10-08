@@ -183,38 +183,42 @@ export default function MediaSettings({
                         <Wand2 size={13} /> Camera effects
                     </span>
                     <div className="flex flex-col gap-1.5">
-                        <button
-                            type="button"
-                            onClick={onToggleBackgroundBlur}
-                            disabled={disabled || backgroundBlur === null}
-                            title={
-                                backgroundBlur === null
-                                    ? 'Not available — requires Windows/macOS/ChromeOS (some Chrome versions also need chrome://flags/#enable-experimental-web-platform-features)'
-                                    : undefined
-                            }
-                            className={`px-3 py-1.5 text-xs rounded-lg border transition ${backgroundBlur === true
-                                ? 'bg-indigo-600 border-indigo-500 text-white'
-                                : 'bg-gray-900 border-gray-700 text-gray-300 hover:border-gray-500'
-                                } disabled:opacity-50 disabled:cursor-not-allowed`}
-                        >
-                            Background blur {backgroundBlur === null ? '(unavailable)' : backgroundBlur ? 'on' : 'off'}
-                        </button>
-                        <button
-                            type="button"
-                            onClick={onToggleGreenScreen}
-                            disabled={disabled || greenScreen === null}
-                            title={
-                                greenScreen === null
-                                    ? 'Not available — requires Windows/macOS/ChromeOS (some Chrome versions also need chrome://flags/#enable-experimental-web-platform-features)'
-                                    : undefined
-                            }
-                            className={`px-3 py-1.5 text-xs rounded-lg border transition ${greenScreen === true
-                                ? 'bg-indigo-600 border-indigo-500 text-white'
-                                : 'bg-gray-900 border-gray-700 text-gray-300 hover:border-gray-500'
-                                } disabled:opacity-50 disabled:cursor-not-allowed`}
-                        >
-                            Green screen {greenScreen === null ? '(unavailable)' : greenScreen ? 'on' : 'off'}
-                        </button>
+                        <div className="grid grid-cols-2 gap-1.5">
+                            <button
+                                type="button"
+                                onClick={onToggleBackgroundBlur}
+                                disabled={disabled || backgroundBlur === null}
+                                title={
+                                    backgroundBlur === null
+                                        ? 'Unavailable — needs OS camera effects + the Experimental Web Platform features flag (see README → Native background effects)'
+                                        : undefined
+                                }
+                                className={`px-3 py-1.5 text-xs rounded-lg border transition ${backgroundBlur === true
+                                    ? 'bg-indigo-600 border-indigo-500 text-white'
+                                    : 'bg-gray-900 border-gray-700 text-gray-300 hover:border-gray-500'
+                                    } disabled:opacity-50 disabled:cursor-not-allowed`}
+                                data-testid="blur-toggle"
+                            >
+                                Blur{backgroundBlur === null ? '' : backgroundBlur ? ' on' : ' off'}
+                            </button>
+                            <button
+                                type="button"
+                                onClick={onToggleGreenScreen}
+                                disabled={disabled || greenScreen === null}
+                                title={
+                                    greenScreen === null
+                                        ? 'Unavailable — needs OS camera effects + the Experimental Web Platform features flag (see README → Native background effects)'
+                                        : undefined
+                                }
+                                className={`px-3 py-1.5 text-xs rounded-lg border transition ${greenScreen === true
+                                    ? 'bg-indigo-600 border-indigo-500 text-white'
+                                    : 'bg-gray-900 border-gray-700 text-gray-300 hover:border-gray-500'
+                                    } disabled:opacity-50 disabled:cursor-not-allowed`}
+                                data-testid="green-screen-toggle"
+                            >
+                                Green screen{greenScreen === null ? '' : greenScreen ? ' on' : ' off'}
+                            </button>
+                    </div>
                         <button
                             type="button"
                             onClick={onToggleMirrorPreview}

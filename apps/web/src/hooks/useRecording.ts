@@ -33,6 +33,9 @@ export function useRecording({ onRecordingComplete, storageMode = 'auto' }: UseR
    */
   const keptSinkRef = useRef<RecordingSink | null>(null);
   const timerIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  // Set synchronously around startRecording's async body so two racing starts
+  // (e.g. a double-fired countdown) can never both create a recorder + timer.
+  const startInProgressRef = useRef(false);
   const isPausedRef = useRef(false);
   const isStoppingRef = useRef(false);
 
@@ -51,137 +54,145 @@ export function useRecording({ onRecordingComplete, storageMode = 'auto' }: UseR
     // 'paused' counts as active — restarting over a paused recorder would
     // detach (and destroy) its still-live sink.
     if (
+      startInProgressRef.current ||
       isStoppingRef.current ||
       (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive')
     ) {
       return false;
     }
+    startInProgressRef.current = true;
 
-    setError(null);
-    isStoppingRef.current = false;
-
-    if (!stream || stream.getTracks().length === 0) {
-      throw new RecordingError(
-        RecordingErrorCode.STREAM_INACTIVE,
-        'Invalid or empty stream provided',
-        true,
-        'Please select a screen or camera to record'
-      );
-    }
-
-    const codec = findSupportedCodec();
-    if (!codec) {
-      throw new RecordingError(
-        RecordingErrorCode.CODEC_NOT_SUPPORTED,
-        'No supported codec found',
-        false,
-        'Your browser does not support video recording'
-      );
-    }
-
-    // Release the previous recording's stored file (the UI has dropped it by
-    // now — a new recording replaces the previous one) plus any unfinished sink.
-    const previousSink = sinkRef.current;
-    sinkRef.current = null;
-    void previousSink?.discard();
-    const previousKept = keptSinkRef.current;
-    keptSinkRef.current = null;
-    void previousKept?.discard();
-
-    // Chunks are spooled to disk (OPFS) so RAM stays flat for long recordings
-    const sink = await createRecordingSink(codec.mimeType || 'video/webm', storageMode);
-    sinkRef.current = sink;
-    setStorageBackend(sink.backend);
-    setStorageDegraded(storageMode === 'opfs' && sink.backend === 'memory');
-
-    // If the encoder refuses this stream/mime, release the just-created sink so
-    // no orphaned temp file is left behind, then let the caller report it.
-    let mediaRecorder: MediaRecorder;
     try {
-      mediaRecorder = new MediaRecorder(stream, {
-        mimeType: codec.mimeType,
-        videoBitsPerSecond: codec.videoBitsPerSecond,
-        audioBitsPerSecond: RECORDING_CONFIG.AUDIO.BITRATE,
-      });
-    } catch (err) {
-      if (sinkRef.current === sink) sinkRef.current = null;
-      await sink.discard();
-      throw err;
-    }
 
-    mediaRecorderRef.current = mediaRecorder;
+      setError(null);
+      isStoppingRef.current = false;
 
-    mediaRecorder.ondataavailable = (event) => {
-      if (event.data?.size > 0) {
-        sink.write(event.data);
+      if (!stream || stream.getTracks().length === 0) {
+        throw new RecordingError(
+          RecordingErrorCode.STREAM_INACTIVE,
+          'Invalid or empty stream provided',
+          true,
+          'Please select a screen or camera to record'
+        );
       }
-    };
 
-    mediaRecorder.onerror = (e: Event & { error?: DOMException }) => {
-      const recErr = e.error
-        ? RecordingError.fromDOMException(e.error)
-        : new RecordingError(RecordingErrorCode.RECORDER_FAILED, 'MediaRecorder error', true);
-      setError(recErr);
-      clearTimer();
-      setIsRecording(false);
-      isStoppingRef.current = false;
-    };
+      const codec = findSupportedCodec();
+      if (!codec) {
+        throw new RecordingError(
+          RecordingErrorCode.CODEC_NOT_SUPPORTED,
+          'No supported codec found',
+          false,
+          'Your browser does not support video recording'
+        );
+      }
 
-    mediaRecorder.onstop = () => {
-      clearTimer();
-      setIsRecording(false);
-      setIsPaused(false);
-      isStoppingRef.current = false;
+      // Release the previous recording's stored file (the UI has dropped it by
+      // now — a new recording replaces the previous one) plus any unfinished sink.
+      const previousSink = sinkRef.current;
+      sinkRef.current = null;
+      void previousSink?.discard();
+      const previousKept = keptSinkRef.current;
+      keptSinkRef.current = null;
+      void previousKept?.discard();
 
-      void (async () => {
-        // The sink was replaced or discarded (e.g. page unmount) - nothing to finish
-        if (sinkRef.current !== sink) return;
-        try {
-          const result = await sink.finish();
-          if (sinkRef.current === sink) sinkRef.current = null;
-          // From here on the returned blob OWNS the sink's file; it may only be
-          // released once the UI drops the recording.
-          keptSinkRef.current = sink;
-          if (result.size > 0) {
-            onRecordingComplete(result.blob);
-          } else {
+      // Chunks are spooled to disk (OPFS) so RAM stays flat for long recordings
+      const sink = await createRecordingSink(codec.mimeType || 'video/webm', storageMode);
+      sinkRef.current = sink;
+      setStorageBackend(sink.backend);
+      setStorageDegraded(storageMode === 'opfs' && sink.backend === 'memory');
+
+      // If the encoder refuses this stream/mime, release the just-created sink so
+      // no orphaned temp file is left behind, then let the caller report it.
+      let mediaRecorder: MediaRecorder;
+      try {
+        mediaRecorder = new MediaRecorder(stream, {
+          mimeType: codec.mimeType,
+          videoBitsPerSecond: codec.videoBitsPerSecond,
+          audioBitsPerSecond: RECORDING_CONFIG.AUDIO.BITRATE,
+        });
+      } catch (err) {
+        if (sinkRef.current === sink) sinkRef.current = null;
+        await sink.discard();
+        throw err;
+      }
+
+      mediaRecorderRef.current = mediaRecorder;
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data?.size > 0) {
+          sink.write(event.data);
+        }
+      };
+
+      mediaRecorder.onerror = (e: Event & { error?: DOMException }) => {
+        const recErr = e.error
+          ? RecordingError.fromDOMException(e.error)
+          : new RecordingError(RecordingErrorCode.RECORDER_FAILED, 'MediaRecorder error', true);
+        setError(recErr);
+        clearTimer();
+        setIsRecording(false);
+        isStoppingRef.current = false;
+      };
+
+      mediaRecorder.onstop = () => {
+        clearTimer();
+        setIsRecording(false);
+        setIsPaused(false);
+        isStoppingRef.current = false;
+
+        void (async () => {
+          // The sink was replaced or discarded (e.g. page unmount) - nothing to finish
+          if (sinkRef.current !== sink) return;
+          try {
+            const result = await sink.finish();
+            if (sinkRef.current === sink) sinkRef.current = null;
+            // From here on the returned blob OWNS the sink's file; it may only be
+            // released once the UI drops the recording.
+            keptSinkRef.current = sink;
+            if (result.size > 0) {
+              onRecordingComplete(result.blob);
+            } else {
+              setError(new RecordingError(
+                RecordingErrorCode.RECORDER_FAILED,
+                'Recording produced no data',
+                true,
+                'Recording failed: no data captured'
+              ));
+            }
+          } catch (err) {
+            if (sinkRef.current === sink) sinkRef.current = null;
             setError(new RecordingError(
               RecordingErrorCode.RECORDER_FAILED,
-              'Recording produced no data',
+              'Failed to store recording',
               true,
-              'Recording failed: no data captured'
+              err instanceof Error ? `Failed to save the recording: ${err.message}` : 'Failed to save the recording to disk'
             ));
           }
-        } catch (err) {
-          if (sinkRef.current === sink) sinkRef.current = null;
-          setError(new RecordingError(
-            RecordingErrorCode.RECORDER_FAILED,
-            'Failed to store recording',
-            true,
-            err instanceof Error ? `Failed to save the recording: ${err.message}` : 'Failed to save the recording to disk'
-          ));
-        }
-      })();
-    };
+        })();
+      };
 
-    try {
-      mediaRecorder.start(1000);
-    } catch (err) {
-      mediaRecorderRef.current = null;
-      if (sinkRef.current === sink) sinkRef.current = null;
-      await sink.discard();
-      throw err;
-    }
-    setIsRecording(true);
-    setRecordingTime(0);
-
-    timerIntervalRef.current = setInterval(() => {
-      if (!isPausedRef.current) {
-        setRecordingTime((prev) => prev + 1);
+      try {
+        mediaRecorder.start(1000);
+      } catch (err) {
+        mediaRecorderRef.current = null;
+        if (sinkRef.current === sink) sinkRef.current = null;
+        await sink.discard();
+        throw err;
       }
-    }, 1000);
+      setIsRecording(true);
+      setRecordingTime(0);
 
-    return true;
+      clearTimer(); // never stack timers — a leaked interval makes the clock run fast
+      timerIntervalRef.current = setInterval(() => {
+        if (!isPausedRef.current) {
+          setRecordingTime((prev) => prev + 1);
+        }
+      }, 1000);
+
+      return true;
+    } finally {
+      startInProgressRef.current = false;
+    }
   }, [onRecordingComplete, clearTimer, storageMode]);
 
   /** Drop the stored recording the UI has released (e.g. "New recording"). */

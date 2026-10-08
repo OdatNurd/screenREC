@@ -147,7 +147,9 @@ Downloads go straight to the browser's download folder under the name shown in t
 Failure behavior is explicit:
 
 - **Wrong password (401)** → clear "Wrong password" error and **no** automatic download; the recording stays available so you can retry.
-- **Server/network failure** → WebM is downloaded as a fallback, with a notification stating exactly that.
+- **Server/network failure** → a clear failure dialog with **Retry MP4** and an explicit **Download WebM instead** option — WebM is never substituted silently.
+
+The conversion progress UI reports only measured progress: a real upload percentage while the file uploads, then an indeterminate "Converting on the server" phase (server-side progress cannot be measured from the browser).
 
 ## Browser support
 
@@ -160,12 +162,24 @@ Failure behavior is explicit:
 
 ### Native background effects — support notes
 
-The blur/green-screen toggles are **feature-detected** and only appear when the platform exposes the native capability (`backgroundBlur` / `backgroundSegmentationMask` on the camera track):
+The blur/green-screen toggles are **feature-detected** and only appear when the platform exposes the native capability (`backgroundBlur` / `backgroundSegmentationMask` on the camera track). Both APIs are still **experimental** in Chromium, so two independent gates must be open. If either is missing the toggles show "(unavailable)":
 
-- Chromium browsers on **Windows**: full toggle control.
-- **macOS / ChromeOS**: blur is controlled by the OS (Control Center); the app observes and reflects state, the toggle may not be able to change it.
-- Some Chrome versions require the `chrome://flags/#enable-experimental-web-platform-features` flag.
-- No wasm/ML fallback by design — where the OS can't do it, the feature stays hidden.
+1. **Browser flag — required on current Chrome.** Open `chrome://flags/#enable-experimental-web-platform-features`, set it to **Enabled**, and relaunch Chrome. The Background Blur API shipped behind this flag in Chrome 114 and its origin trial ended at Chrome 117 without an unflagged release; the Background Segmentation/Mask API is still incubating — the flag is the only switch today.
+2. **Platform/OS support.** The OS must expose a camera segmentation effect:
+   - **Windows** — Windows Studio Effects, which requires an **NPU (Copilot+ PC)** and the **built-in camera**; external webcams are not supported. Check Settings › Bluetooth & devices › Cameras: the "Windows Studio Effects" section must be present.
+   - **macOS / ChromeOS** — blur is controlled by the OS (Control Center); the app observes and reflects the state, and the in-app toggle may not be able to change it.
+
+#### Enabling — checklist
+
+1. Chrome → `chrome://flags/#enable-experimental-web-platform-features` → **Enabled** → **Relaunch**.
+2. Confirm the flag now reads **Enabled** in the `chrome://flags` list.
+3. Windows only: confirm Windows Studio Effects exists (Settings › Bluetooth & devices › Cameras) and use the laptop's built-in camera.
+4. Open the app and turn the camera on. The Camera effects buttons read `on`/`off` when controllable, "(unavailable)" when one of the gates above is closed.
+
+Notes:
+
+- From JavaScript, "flag off" and "no platform support" are indistinguishable — `getCapabilities().backgroundBlur` is simply absent in both cases, so the app can only show "(unavailable)" with a hint pointing here.
+- No wasm/ML fallback by design — where the OS can't do it, the feature stays unavailable. If these gates can't be met on target hardware, this feature should be re-evaluated for removal rather than shipped permanently dead.
 
 ## Project structure
 

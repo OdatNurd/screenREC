@@ -40,24 +40,30 @@ export default function DownloadSettingsModal({
     originalDurationMs = 0
 }: DownloadSettingsModalProps) {
     const [name, setName] = useState('Recording');
+    // Once the user edits the name, it sticks for the rest of the session —
+    // reopening the dialog must never clobber a typed name.
+    const [nameTouched, setNameTouched] = useState(false);
     const [format, setFormat] = useState<'webm' | 'mp4'>('webm');
     const [password, setPassword] = useState('');
     const [showPassword, setShowPassword] = useState(false);
     const [source, setSource] = useState<'edited' | 'original'>('edited');
 
-    // Refresh the default filename and password every time the dialog opens,
-    // so each recording gets a current timestamp and a stale name never sticks.
+    // Refresh the default filename and password every time the dialog opens.
+    // The default (timestamped) name is only seeded while the user hasn't
+    // typed one — a typed name survives reopenings and downloads.
     useEffect(() => {
         if (isOpen) {
             setPassword(sessionStorage.getItem(API_PASSWORD_STORAGE_KEY) || '');
-            const now = new Date();
-            const pad = (n: number) => String(n).padStart(2, '0');
-            const date = `${pad(now.getMonth() + 1)}/${pad(now.getDate())}/${now.getFullYear()}`;
-            const hour12 = now.getHours() % 12 || 12;
-            const time = `${pad(hour12)}:${pad(now.getMinutes())} ${now.getHours() >= 12 ? 'PM' : 'AM'}`;
-            setName(`Recording ${date} ${time}`);
+            if (!nameTouched) {
+                const now = new Date();
+                const pad = (n: number) => String(n).padStart(2, '0');
+                const date = `${pad(now.getMonth() + 1)}/${pad(now.getDate())}/${now.getFullYear()}`;
+                const hour12 = now.getHours() % 12 || 12;
+                const time = `${pad(hour12)}:${pad(now.getMinutes())} ${now.getHours() >= 12 ? 'PM' : 'AM'}`;
+                setName(`Recording ${date} ${time}`);
+            }
         }
-    }, [isOpen]);
+    }, [isOpen, nameTouched]);
 
     if (!isOpen) return null;
 
@@ -151,12 +157,12 @@ export default function DownloadSettingsModal({
                     <input
                         type="text"
                         value={name}
-                        onChange={(e) => setName(e.target.value)}
+                        onChange={(e) => { setName(e.target.value); setNameTouched(true); }}
                         className="w-full px-4 py-3 rounded-xl bg-gray-900 border border-gray-700 text-gray-100 focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/30 outline-none transition"
                         placeholder="My Recording"
                     />
                     <p className="mt-1.5 text-xs text-gray-500">
-                        Spaces and invalid filename characters are converted to _.
+                        Leading/trailing spaces are trimmed; other spaces and invalid characters become _.
                     </p>
                 </div>
 

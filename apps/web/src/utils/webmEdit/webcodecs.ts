@@ -29,6 +29,34 @@ function videoConfig(index: IndexedRecording): VideoDecoderConfig {
   return config;
 }
 
+/**
+ * Race a WebCodecs wait against a timeout. Decoders have been observed to
+ * wedge (flush() never settles) on some hardware decode paths; every caller
+ * must fail loudly with Retry rather than spin forever.
+ */
+async function withTimeout<T>(work: Promise<T>, what: string, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`webcodecs: ${what} timed out after ${Math.round(ms / 1000)}s`)),
+          ms
+        );
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/** Per-operation WebCodecs budgets (ms). */
+const FLUSH_TIMEOUT_MS = 15_000;
+const FRAME_CAPTURE_TIMEOUT_MS = 30_000;
+const CARD_RENDER_TIMEOUT_MS = 45_000;
+const SUBGOP_TIMEOUT_MS = 120_000;
+
 function estimateBitrate(index: IndexedRecording): number {
   const seconds = Math.max(1, index.durationMs / 1000);
   const bps = (index.blob.size * 8) / seconds;
@@ -72,7 +100,13 @@ async function decodeVideoRange(
       })
     );
   }
-  await decoder.flush();
+  try {
+    await withTimeout(decoder.flush(), 'video decode (flush)', FLUSH_TIMEOUT_MS);
+  } catch (error) {
+    try { if (decoder.state !== 'closed') decoder.close(); } catch { /* already closed */ }
+    for (const f of frames) f.close();
+    throw error;
+  }
   decoder.close();
   if (decodeError) {
     for (const f of frames) f.close();
@@ -102,7 +136,12 @@ async function encodeFrame(
     latencyMode: 'quality',
   });
   encoder.encode(frame, { keyFrame });
-  await encoder.flush();
+  try {
+    await withTimeout(encoder.flush(), 'video encode (flush)', FLUSH_TIMEOUT_MS);
+  } catch (error) {
+    try { if (encoder.state !== 'closed') encoder.close(); } catch { /* already closed */ }
+    throw error;
+  }
   encoder.close();
   if (encodeError) throw encodeError;
   return out;
@@ -114,6 +153,14 @@ async function encodeFrame(
  * keyframe — so a kept segment can start at exactly `fromMs`.
  */
 export async function reencodeSubGop(
+  index: IndexedRecording,
+  fromMs: number,
+  toMs: number
+): Promise<GeneratedBlock[]> {
+  return withTimeout(reencodeSubGopInner(index, fromMs, toMs), 'sub-GOP re-encode', SUBGOP_TIMEOUT_MS);
+}
+
+async function reencodeSubGopInner(
   index: IndexedRecording,
   fromMs: number,
   toMs: number
@@ -157,6 +204,10 @@ export async function reencodeSubGop(
  * close the returned frame.
  */
 export async function grabFrame(index: IndexedRecording, atMs: number): Promise<VideoFrame> {
+  return withTimeout(grabFrameInner(index, atMs), 'frame capture', FRAME_CAPTURE_TIMEOUT_MS);
+}
+
+async function grabFrameInner(index: IndexedRecording, atMs: number): Promise<VideoFrame> {
   let gopStart = 0;
   let nextKf = Infinity;
   for (const kf of index.keyframesMs) {
@@ -252,6 +303,13 @@ export function drawTitleCard(
  * it repeatedly to hold it on screen for the card's duration.
  */
 export async function generateTitleCard(
+  index: IndexedRecording,
+  spec: TitleCardSpec
+): Promise<Uint8Array> {
+  return withTimeout(generateTitleCardInner(index, spec), 'title-card render', CARD_RENDER_TIMEOUT_MS);
+}
+
+async function generateTitleCardInner(
   index: IndexedRecording,
   spec: TitleCardSpec
 ): Promise<Uint8Array> {

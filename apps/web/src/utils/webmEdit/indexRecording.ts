@@ -17,14 +17,36 @@ import type {
   VideoTrackInfo,
 } from './types';
 
+/**
+ * Smallest VP9 level whose MaxLumaPs fits the frame size (VP9 spec, Table 10).
+ * The level caps the picture size; stating too low a level makes some
+ * (hardware) decoders under-allocate and stall — our old hard-coded level 1.0
+ * was wrong for every resolution we record.
+ */
+function vp9LevelCode(width: number, height: number): number {
+  const luma = width * height;
+  if (luma <= 36_864) return 10;
+  if (luma <= 73_728) return 11;
+  if (luma <= 122_880) return 20;
+  if (luma <= 245_760) return 21;
+  if (luma <= 552_960) return 30;
+  if (luma <= 983_040) return 31;
+  if (luma <= 2_228_224) return 40;
+  if (luma <= 8_912_896) return 50;
+  return 60;
+}
+
 /** Map a Matroska CodecID to a WebCodecs codec string. */
-export function webCodecsCodec(codecId: string): string {
+export function webCodecsCodec(codecId: string, width = 0, height = 0): string {
   switch (codecId) {
     case 'V_VP8':
       return 'vp8';
-    case 'V_VP9':
-      // Level 1.0, 8-bit 4:2:0 — the profile MediaRecorder emits.
-      return 'vp09.00.10.08';
+    case 'V_VP9': {
+      // Profile 0, 8-bit 4:2:0 (what MediaRecorder emits), with the level
+      // derived from the actual frame size.
+      const level = width > 0 && height > 0 ? vp9LevelCode(width, height) : 41;
+      return `vp09.00.${level}.08`;
+    }
     case 'V_AV1':
       return 'av01.0.04M.08';
     case 'A_OPUS':
@@ -108,7 +130,7 @@ async function parseTrackEntry(
   }
 
   if (!trackNumber || !codecId) return null;
-  const codec = webCodecsCodec(codecId);
+  const codec = webCodecsCodec(codecId, width, height);
   if (trackType === 1) {
     return { trackNumber, codecId, codec, width, height, codecPrivate };
   }

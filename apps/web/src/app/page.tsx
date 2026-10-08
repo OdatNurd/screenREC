@@ -74,6 +74,14 @@ export default function RecordPage() {
   const [isConverting, setIsConverting] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
   const [conversionProgress, setConversionProgress] = useState(0);
+  /** Honest phase of the MP4 flow: measured upload vs unmeasured server work. */
+  const [conversionPhase, setConversionPhase] = useState<'uploading' | 'converting'>('uploading');
+  /** A failed MP4 conversion awaiting the user's choice (retry / WebM / cancel). */
+  const [convertFailure, setConvertFailure] = useState<{
+    reason: string;
+    settings: DownloadSettings;
+    sourceBlob: Blob;
+  } | null>(null);
 
   // ---- Editing (trim / interior cuts / title cards) ----
   const [editMode, setEditMode] = useState(false);
@@ -83,12 +91,18 @@ export default function RecordPage() {
   const [edlFuture, setEdlFuture] = useState<EdlState[]>([]);
   const [cardModalAtMs, setCardModalAtMs] = useState<number | null>(null);
   const [isRenderingEdit, setIsRenderingEdit] = useState(false);
+  // True while the edit list is being built (Edit button shows a spinner).
+  const [isIndexing, setIsIndexing] = useState(false);
   const [playheadMs, setPlayheadMs] = useState(0);
   const playerVideoRef = useRef<HTMLVideoElement | null>(null);
+
+  // Declared early: the title-card preview effect below reports failures.
+  const { notifications, showNotification, removeNotification } = useNotifications();
 
   // Pre-rendered title-card images (frozen frame + text panel) for the
   // WYSIWYG playback preview, keyed by card id.
   const cardImagesRef = useRef<Map<string, string>>(new Map());
+  const cardPreviewWarnedRef = useRef(false);
   const [cardImages, setCardImages] = useState<Record<string, string>>({});
 
   /** Output-time playback schedule mirroring the renderer's layout. */
@@ -121,15 +135,23 @@ export default function RecordPage() {
             cardImagesRef.current.set(card.id, canvas.toDataURL('image/png'));
           }
           frame.close();
-        } catch {
-          // Preview falls back to a plain text overlay for this card.
+        } catch (error) {
+          // Preview falls back to the box-positioned text overlay for this
+          // card — but say so once: the download will fail the same way.
+          if (!cardPreviewWarnedRef.current) {
+            cardPreviewWarnedRef.current = true;
+            showNotification(
+              `Title card preview could not capture a frame (${error instanceof Error ? error.message : 'unknown error'})`,
+              'error'
+            );
+          }
         }
         if (cancelled) return;
         setCardImages(Object.fromEntries(cardImagesRef.current));
       }
     })();
     return () => { cancelled = true; };
-  }, [editIndex, edl]);
+  }, [editIndex, edl, showNotification]);
 
   // Device selection
   const [cameraDeviceId, setCameraDeviceId] = useState('');
@@ -157,8 +179,8 @@ export default function RecordPage() {
   const cameraVideoRef = useRef<HTMLVideoElement>(null);
   const previewContainerRef = useRef<HTMLDivElement>(null);
   const countdownIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const countdownStartTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-  const { notifications, showNotification, removeNotification } = useNotifications();
   const { cameras, microphones, refresh: refreshDevices } = useDeviceList();
 
   // Mobile detection
@@ -342,11 +364,21 @@ export default function RecordPage() {
 
   const handleStartCamera = useCallback(async () => {
     await toggleCamera(cameraDeviceId || null);
-    // Camera permission is granted by the time the toggle resolves, which
+    // Camera implies mic: if the camera is now on and the microphone is off,
+    // enable it too (with the selected device). This is one-directional — the
+    // mic is never forced off here, so "camera off, mic on" and "screen + mic"
+    // keep working. Camera start failures leave the mic untouched.
+    if (cameraStreamRef.current && !audioStreamRef.current) {
+      await startMic(micDeviceId || null);
+      if (!audioStreamRef.current) {
+        showNotification('Camera is on, but the microphone could not be started', 'error');
+      }
+    }
+    // Camera/mic permission is granted by the time the toggles resolve, which
     // unredacts device labels/ids — re-enumerate so both pickers reflect the
     // full device list without a page refresh.
     refreshDevices();
-  }, [toggleCamera, cameraDeviceId, refreshDevices]);
+  }, [toggleCamera, cameraDeviceId, refreshDevices, startMic, micDeviceId, cameraStreamRef, audioStreamRef, showNotification]);
 
   const handleToggleMic = useCallback(async () => {
     await toggleMic(micDeviceId || null);
@@ -562,30 +594,33 @@ export default function RecordPage() {
       clearInterval(countdownIntervalRef.current);
       countdownIntervalRef.current = null;
     }
+    if (countdownStartTimeoutRef.current) {
+      clearTimeout(countdownStartTimeoutRef.current);
+      countdownStartTimeoutRef.current = null;
+    }
     setCountdown(3);
 
+    // The counter lives in a plain variable: state updaters must stay pure.
+    // React StrictMode double-invokes updaters in dev, and the old impure
+    // updater scheduled the recording start twice per countdown — leaking a
+    // recorder + timer interval per session and making the on-screen clock
+    // run 2x, 3x, ... fast.
+    let remaining = 3;
     countdownIntervalRef.current = setInterval(() => {
-      setCountdown((prev) => {
-        if (prev === null) {
-          if (countdownIntervalRef.current) {
-            clearInterval(countdownIntervalRef.current);
-          }
-          return null;
+      remaining -= 1;
+      if (remaining <= 0) {
+        if (countdownIntervalRef.current) {
+          clearInterval(countdownIntervalRef.current);
+          countdownIntervalRef.current = null;
         }
-
-        if (prev <= 1) {
-          if (countdownIntervalRef.current) {
-            clearInterval(countdownIntervalRef.current);
-            countdownIntervalRef.current = null;
-          }
-          setTimeout(() => {
-            actuallyStartRecording();
-          }, 100);
-          return null;
-        }
-
-        return prev - 1;
-      });
+        setCountdown(null);
+        countdownStartTimeoutRef.current = setTimeout(() => {
+          countdownStartTimeoutRef.current = null;
+          actuallyStartRecording();
+        }, 100);
+      } else {
+        setCountdown(remaining);
+      }
     }, 1000);
   }, [actuallyStartRecording]);
 
@@ -675,6 +710,7 @@ export default function RecordPage() {
       return;
     }
     if (!recordedBlob) return;
+    setIsIndexing(true);
     try {
       const index = await indexRecording(recordedBlob);
       if (!index.video) {
@@ -695,6 +731,8 @@ export default function RecordPage() {
         `Could not read recording for editing (${error instanceof Error ? error.message : 'unknown error'})`,
         'error'
       );
+    } finally {
+      setIsIndexing(false);
     }
   }, [editMode, recordedBlob, showNotification]);
 
@@ -739,6 +777,65 @@ export default function RecordPage() {
     setShowDownloadModal(true);
   }, [recordedBlob]);
 
+  /** Save a recording under the dialog's filename (trimmed, then sanitized). */
+  const saveRecording = useCallback(async (blob: Blob, name: string, extension: string) => {
+    const trimmed = name.trim();
+    const filename = trimmed
+      ? `${trimmed.replace(/[^a-zA-Z0-9-_]/g, '_')}.${extension}`
+      : `recording-${Date.now()}.${extension}`;
+    const saved = await saveBlob(blob, filename);
+    if (saved) {
+      showNotification('Recording downloaded successfully', 'success');
+    }
+    return saved;
+  }, [showNotification]);
+
+  /**
+   * Server-side MP4 conversion. Failures never silently substitute WebM —
+   * they surface a dialog where the user picks Retry or the WebM fallback.
+   */
+  const runMp4Convert = useCallback(async (sourceBlob: Blob, settings: DownloadSettings) => {
+    setIsConverting(true);
+    setConversionPhase('uploading');
+    setConversionProgress(0);
+    showNotification('Converting to MP4 via server...', 'info');
+    try {
+      const mp4Blob = await convertToMp4Api(sourceBlob, {
+        onProgress: setConversionProgress,
+        onPhase: setConversionPhase,
+        password: settings.password,
+      });
+      await saveRecording(mp4Blob, settings.name, 'mp4');
+    } catch (error) {
+      if (error instanceof ApiAuthError) {
+        // Wrong password: do NOT substitute WebM — let the user retry.
+        showNotification('Wrong password — MP4 was not converted. Your recording is still here; try again with the correct password.', 'error');
+        return;
+      }
+      const reason = error instanceof ApiUnreachableError
+        ? 'convert service unreachable'
+        : error instanceof Error ? error.message : 'unknown error';
+      setConvertFailure({ reason, settings, sourceBlob });
+    } finally {
+      setIsConverting(false);
+    }
+  }, [saveRecording, showNotification]);
+
+  const handleConvertRetry = useCallback(() => {
+    const failure = convertFailure;
+    setConvertFailure(null);
+    if (failure) void runMp4Convert(failure.sourceBlob, failure.settings);
+  }, [convertFailure, runMp4Convert]);
+
+  const handleConvertFallbackWebm = useCallback(() => {
+    const failure = convertFailure;
+    setConvertFailure(null);
+    if (failure) {
+      showNotification('Downloading WebM instead', 'info');
+      void saveRecording(failure.sourceBlob, failure.settings.name, 'webm');
+    }
+  }, [convertFailure, saveRecording, showNotification]);
+
   const handleDownloadConfirm = useCallback(async (settings: DownloadSettings) => {
     if (!recordedBlob) return;
     setShowDownloadModal(false);
@@ -769,49 +866,12 @@ export default function RecordPage() {
       return;
     }
 
-    let blobToDownload = sourceBlob;
-    let extension = 'webm';
-
     if (settings.format === 'mp4') {
-      setIsConverting(true);
-      setConversionProgress(0);
-      showNotification('Converting to MP4 via server...', 'info');
-      try {
-        const mp4Blob = await convertToMp4Api(sourceBlob, {
-          onProgress: setConversionProgress,
-          password: settings.password,
-        });
-        if (mp4Blob) {
-          blobToDownload = mp4Blob;
-          extension = 'mp4';
-          showNotification('Conversion complete!', 'success');
-        } else {
-          showNotification('MP4 conversion failed — downloading WebM instead', 'info');
-        }
-      } catch (error) {
-        if (error instanceof ApiAuthError) {
-          // Wrong password: do NOT silently substitute WebM — let the user retry
-          setIsConverting(false);
-          showNotification('Wrong password — MP4 was not converted. Your recording is still here; try again with the correct password.', 'error');
-          return;
-        }
-        const reason = error instanceof ApiUnreachableError
-          ? 'convert service unreachable'
-          : error instanceof Error ? error.message : 'unknown error';
-        showNotification(`MP4 conversion failed (${reason}) — downloading WebM instead`, 'info');
-      } finally {
-        setIsConverting(false);
-      }
+      await runMp4Convert(sourceBlob, settings);
+      return;
     }
-
-    const filename = settings.name
-      ? `${settings.name.replace(/[^a-zA-Z0-9-_]/g, '_')}.${extension}`
-      : `recording-${Date.now()}.${extension}`;
-    const saved = await saveBlob(blobToDownload, filename);
-    if (saved) {
-      showNotification('Recording downloaded successfully', 'success');
-    }
-  }, [recordedBlob, editIndex, edl, hasEdits, showNotification]);
+    await saveRecording(sourceBlob, settings.name, 'webm');
+  }, [recordedBlob, editIndex, edl, hasEdits, runMp4Convert, saveRecording, showNotification]);
 
   const handleNewRecording = useCallback(() => {
     if (recordedVideoUrl) {
@@ -913,14 +973,66 @@ export default function RecordPage() {
           <div className="bg-gray-800 border border-gray-700 rounded-2xl p-6 sm:p-8 shadow-2xl flex flex-col items-center gap-3 sm:gap-4 max-w-sm w-full mx-4">
             <div className="w-12 h-12 sm:w-16 sm:h-16 border-4 border-indigo-500/30 border-t-indigo-400 rounded-full animate-spin" />
             <h3 className="text-lg sm:text-xl font-semibold text-gray-100">Converting to MP4</h3>
-            <p className="text-sm sm:text-base text-gray-400 text-center">Please wait while your recording is being converted...</p>
+            <p className="text-sm sm:text-base text-gray-400 text-center">
+              {conversionPhase === 'uploading'
+                ? 'Uploading your recording to the server...'
+                : 'Converting on the server — long recordings can take a few minutes.'}
+            </p>
             <div className="w-full bg-gray-700 rounded-full h-2">
-              <div
-                className="bg-indigo-500 h-2 rounded-full transition-all duration-300"
-                style={{ width: `${conversionProgress}%` }}
-              />
+              {conversionPhase === 'uploading' ? (
+                <div
+                  className="bg-indigo-500 h-2 rounded-full transition-all duration-300"
+                  style={{ width: `${conversionProgress}%` }}
+                  data-testid="convert-progress"
+                />
+              ) : (
+                <div
+                  className="bg-indigo-500 h-2 rounded-full animate-pulse w-full"
+                  data-testid="convert-progress-indeterminate"
+                />
+              )}
             </div>
-            <span className="text-xs sm:text-sm text-gray-400">{conversionProgress}%</span>
+            <span className="text-xs sm:text-sm text-gray-400" data-testid="convert-phase-label">
+              {conversionPhase === 'uploading'
+                ? `Uploading ${conversionProgress}%`
+                : 'Converting — server progress is not measurable'}
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* MP4 conversion failed: loud choice — retry or explicit WebM fallback */}
+      {convertFailure && (
+        <div className="fixed inset-0 z-40 bg-black/80 flex items-center justify-center p-4" data-testid="convert-failure-dialog">
+          <div className="bg-gray-800 border border-gray-700 rounded-2xl p-6 sm:p-8 shadow-2xl flex flex-col gap-4 max-w-sm w-full mx-4">
+            <h3 className="text-lg sm:text-xl font-semibold text-gray-100">MP4 conversion failed</h3>
+            <p className="text-sm text-gray-300" data-testid="convert-failure-reason">{convertFailure.reason}</p>
+            <p className="text-sm text-gray-400">
+              Your recording is still here. Retry the conversion, or download it as WebM instead.
+            </p>
+            <div className="flex flex-col sm:flex-row gap-2">
+              <button
+                onClick={handleConvertRetry}
+                className="flex-1 px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-medium transition"
+                data-testid="convert-retry"
+              >
+                Retry MP4
+              </button>
+              <button
+                onClick={handleConvertFallbackWebm}
+                className="flex-1 px-4 py-2.5 bg-gray-700 hover:bg-gray-600 text-gray-200 rounded-xl text-sm font-medium transition"
+                data-testid="convert-fallback-webm"
+              >
+                Download WebM instead
+              </button>
+              <button
+                onClick={() => setConvertFailure(null)}
+                className="flex-1 px-4 py-2.5 bg-gray-900 hover:bg-gray-800 text-gray-400 rounded-xl text-sm font-medium transition"
+                data-testid="convert-cancel"
+              >
+                Cancel
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -975,6 +1087,7 @@ export default function RecordPage() {
                 storageDegraded={storageDegraded}
                 onEdit={handleEditToggle}
                 editActive={editMode}
+                editBusy={isIndexing}
                 hasEdits={hasEdits}
               />
             </div>
@@ -1039,6 +1152,7 @@ export default function RecordPage() {
               />
 
               <RecordingControls
+                recordingTime={recordingTime}
                 onStartRecording={handleStartRecording}
                 onStopRecording={handleStopRecording}
                 onPauseRecording={pauseRecording}
@@ -1059,6 +1173,10 @@ export default function RecordPage() {
             </>
           )}
         </div>
+
+        <footer className="mt-8 mb-2 text-center text-[10px] text-gray-500" data-testid="build-footer">
+          screenREC · build {process.env.NEXT_PUBLIC_GIT_SHA ?? 'dev'}
+        </footer>
       </main>
     </div>
   );
