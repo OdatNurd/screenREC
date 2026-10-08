@@ -19,8 +19,10 @@ if [ ! -f ".env" ]; then
     exit 1
 fi
 
-echo "Building $IMAGE..."
-docker build -t "$IMAGE" . || exit 1
+# Commit stamped into the UI footer ("screenREC · build <sha>").
+GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo dev)"
+echo "Building $IMAGE (commit $GIT_SHA)..."
+docker build --build-arg GIT_SHA="$GIT_SHA" -t "$IMAGE" . || exit 1
 
 echo "Stopping and removing existing container..."
 docker rm -f "$CONTAINER_NAME" 2>/dev/null || true

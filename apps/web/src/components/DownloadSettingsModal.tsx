@@ -196,17 +196,19 @@ export default function DownloadSettingsModal({
 
                 {format === 'mp4' && (
                     <div className="mb-5">
-                        <label className="flex items-center gap-1.5 text-sm font-medium text-gray-300 mb-2">
+                        <label htmlFor="transcode-password" className="flex items-center gap-1.5 text-sm font-medium text-gray-300 mb-2">
                             <Lock size={13} /> Transcode password
                         </label>
                         <div className="relative">
                             <input
+                                id="transcode-password"
+                                name="password"
                                 type={showPassword ? 'text' : 'password'}
                                 value={password}
                                 onChange={(e) => setPassword(e.target.value)}
                                 className="w-full px-4 py-3 pr-12 rounded-xl bg-gray-900 border border-gray-700 text-gray-100 focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/30 outline-none transition"
                                 placeholder="Encode Password"
-                                autoComplete="off"
+                                autoComplete="current-password"
                             />
                             <button
                                 type="button"

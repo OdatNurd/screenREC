@@ -29,6 +29,13 @@ RUN pnpm install --frozen-lockfile
 ARG NEXT_PUBLIC_API_USER=api
 ENV NEXT_PUBLIC_API_USER=$NEXT_PUBLIC_API_USER
 
+# Commit shown in the UI footer ("screenREC · build <sha>"). Baked into the
+# frontend at build time; deploy/run.sh passes it automatically, or override
+# with: docker build --build-arg GIT_SHA=$(git rev-parse --short HEAD)
+# Empty falls back to "dev" (there is no .git in the build context).
+ARG GIT_SHA=
+ENV NEXT_PUBLIC_GIT_SHA=$GIT_SHA
+
 # Builds apps/web (Next standalone output) and apps/api (tsc -> dist)
 RUN pnpm build
 
