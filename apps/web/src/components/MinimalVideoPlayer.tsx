@@ -27,13 +27,27 @@ interface MinimalVideoPlayerProps {
     onVideoElement?: (el: HTMLVideoElement | null) => void;
     /** Playhead position for the edit timeline (source ms). */
     onTimeUpdate?: (timeMs: number) => void;
+    /**
+     * Live title-card hold progress (0..1) while a card is on screen, else
+     * null. Lets the timeline show the hold playing out on the card marker.
+     */
+    onCardProgress?: (hold: { cardId: string; fraction: number } | null) => void;
     /** When set, the player shows edited time and plays back the edited cut. */
     preview?: PlayerPreview | null;
 }
 
-export default function MinimalVideoPlayer({ src, onLoadedMetadata, onVideoElement, onTimeUpdate, preview }: MinimalVideoPlayerProps) {
+export default function MinimalVideoPlayer({ src, onLoadedMetadata, onVideoElement, onTimeUpdate, onCardProgress, preview }: MinimalVideoPlayerProps) {
     const videoRef = useRef<HTMLVideoElement>(null);
     const progressRef = useRef<HTMLDivElement>(null);
+
+    // The supervision tick below must not restart when a callback identity
+    // changes (that would dismiss an in-flight card hold).
+    const onTimeUpdateRef = useRef(onTimeUpdate);
+    const onCardProgressRef = useRef(onCardProgress);
+    useEffect(() => {
+        onTimeUpdateRef.current = onTimeUpdate;
+        onCardProgressRef.current = onCardProgress;
+    });
 
     const [isPlaying, setIsPlaying] = useState(false);
     const [currentTime, setCurrentTime] = useState(0);
@@ -82,13 +96,40 @@ export default function MinimalVideoPlayer({ src, onLoadedMetadata, onVideoEleme
 
     const previewDurMs = useMemo(() => (preview ? previewDurationMs(preview.segments) : 0), [preview]);
 
+    // Source -> output with card context. A card's illustrative source span
+    // [fromMs, fromMs + durationMs) overlaps the footage that follows it, so
+    // the mapping depends on whether the hold has played: an unconsumed card
+    // reads as "at the card" (its output start), and just after the hold the
+    // race window right before the insertion point maps to the hold's end.
+    // Without this the bar stalls on the card's start after every hold, then
+    // jumps — and briefly jumps back at resume.
+    const outMsFor = useCallback((srcMs: number): number => {
+        if (!preview) return srcMs;
+        for (let i = 0; i < preview.segments.length; i++) {
+            const s = preview.segments[i];
+            if (s.kind !== 'card' || !s.card) continue;
+            const played = consumedCardsRef.current.has(s.card.id);
+            const next = preview.segments[i + 1];
+            const overlapEnd = next && next.kind === 'source'
+                ? Math.min(s.fromMs + s.durationMs, next.toMs)
+                : s.fromMs + s.durationMs;
+            if (!played && srcMs >= s.fromMs && srcMs < overlapEnd) {
+                return s.outMs;
+            }
+            if (played && srcMs >= s.fromMs - 350 && srcMs < s.fromMs) {
+                return s.outMs + s.durationMs;
+            }
+        }
+        return toOutputMs(preview.segments, srcMs);
+    }, [preview]);
+
     // What the clock and progress bar show: edited (output) time when a
     // preview is active, the raw source time otherwise.
     const displayDurationSec = preview ? previewDurMs / 1000 : duration;
     const displayCurrentSec = activeCard
         ? (activeCard.outMs + Math.min(cardElapsedMs, activeCard.durationMs)) / 1000
         : preview
-            ? toOutputMs(preview.segments, currentTime * 1000) / 1000
+            ? outMsFor(currentTime * 1000) / 1000
             : currentTime;
 
     const seekToOutputSec = useCallback((outSec: number) => {
@@ -220,6 +261,7 @@ export default function MinimalVideoPlayer({ src, onLoadedMetadata, onVideoEleme
             }
             activeCardRef.current = null;
             setActiveCard(null);
+            onCardProgressRef.current?.(null);
         };
 
         // A user seek replays cards behind the new position only when they
@@ -240,7 +282,17 @@ export default function MinimalVideoPlayer({ src, onLoadedMetadata, onVideoEleme
             if (!v) return;
             const card = activeCardRef.current;
             if (card) {
-                setCardElapsedMs(Math.min(performance.now() - cardStartRef.current, card.durationMs));
+                const elapsed = Math.min(performance.now() - cardStartRef.current, card.durationMs);
+                setCardElapsedMs(elapsed);
+                // The <video> is paused during a hold, so `timeupdate` goes
+                // quiet and the edit playhead would starve. Keep feeding it
+                // (parked at the card's insertion point) and the hold
+                // progress from the same clock that drives the bar.
+                onTimeUpdateRef.current?.(card.fromMs);
+                onCardProgressRef.current?.({
+                    cardId: card.card?.id ?? '',
+                    fraction: card.durationMs > 0 ? elapsed / card.durationMs : 1,
+                });
                 return;
             }
             if (v.paused) return;

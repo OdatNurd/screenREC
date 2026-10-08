@@ -63,9 +63,12 @@ export function previewDurationMs(segments: PreviewSegment[]): number {
 }
 
 /**
- * Source ms -> output ms. A card's insertion point maps to the START of the
- * card's output span. Positions in removed regions map to where playback
- * would resume (the next kept point).
+ * Source ms -> output ms. Source segments take precedence over cards: a
+ * card's illustrative source span [fromMs, fromMs + durationMs) overlaps the
+ * source segment that follows it (both start at the insertion point), and
+ * once the hold has played those positions are footage again — they map to
+ * the card's END, not its start. Positions in removed regions map to where
+ * playback would resume (the next kept point).
  */
 export function toOutputMs(segments: PreviewSegment[], sourceMs: number): number {
   if (segments.length === 0) return sourceMs;
@@ -73,6 +76,8 @@ export function toOutputMs(segments: PreviewSegment[], sourceMs: number): number
     if (s.kind === 'source' && sourceMs >= s.fromMs && sourceMs < s.toMs) {
       return s.outMs + (sourceMs - s.fromMs);
     }
+  }
+  for (const s of segments) {
     if (s.kind === 'card' && sourceMs >= s.fromMs && sourceMs < s.fromMs + s.durationMs) {
       return s.outMs;
     }

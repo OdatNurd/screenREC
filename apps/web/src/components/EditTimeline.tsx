@@ -18,7 +18,8 @@ import {
   Redo2,
   X,
 } from 'lucide-react';
-import type { EdlState, IndexedRecording } from '@/utils/webmEdit';
+import { keptRanges } from '@/utils/webmEdit';
+import type { EdlState, IndexedRecording, TitleCardSpec } from '@/utils/webmEdit';
 
 interface EditTimelineProps {
   index: IndexedRecording;
@@ -29,14 +30,21 @@ interface EditTimelineProps {
   onChange: (edl: EdlState) => void;
   onSeek: (ms: number) => void;
   onAddCard: (atMs: number) => void;
+  /** Open the card editor for an already-placed card. */
+  onEditCard: (card: TitleCardSpec) => void;
   onUndo: () => void;
   onRedo: () => void;
   onDone: () => void;
+  /** Live hold progress (0..1) of the card currently playing in the preview. */
+  holdProgress?: { cardId: string; fraction: number } | null;
 }
 
 interface DragState {
-  kind: 'trimStart' | 'trimEnd' | 'cutStart' | 'cutEnd';
+  kind: 'trimStart' | 'trimEnd' | 'cutStart' | 'cutEnd' | 'cardEnd' | 'cardMove';
   cutId?: string;
+  cardId?: string;
+  /** For card moves: pointer offset from the card's insertion point. */
+  grabOffsetMs?: number;
 }
 
 function fmt(ms: number): string {
@@ -56,15 +64,17 @@ export default function EditTimeline({
   onChange,
   onSeek,
   onAddCard,
+  onEditCard,
   onUndo,
   onRedo,
   onDone,
+  holdProgress,
 }: EditTimelineProps) {
   const trackRef = useRef<HTMLDivElement>(null);
   const [drag, setDrag] = useState<DragState | null>(null);
   const [selecting, setSelecting] = useState(false);
   const [selection, setSelection] = useState<{ startMs: number; endMs: number } | null>(null);
-  const [dragHint, setDragHint] = useState<{ ms: number; snapped: boolean } | null>(null);
+  const [dragHint, setDragHint] = useState<{ ms: number; snapped: boolean; label?: string } | null>(null);
   const dragRef = useRef<DragState | null>(null);
   const selectionAnchorRef = useRef<number | null>(null);
 
@@ -94,6 +104,44 @@ export default function EditTimeline({
   }, [edl.snapToKeyframes, nearestKeyframe]);
 
   const applyDrag = useCallback((state: DragState, rawMs: number) => {
+    if (state.kind === 'cardEnd' && state.cardId) {
+      // A card hold is not a cut point, so its length is free (never
+      // keyframe-snapped). It may only span the kept region containing its
+      // insertion point — never removed footage or past the recording — and
+      // never shrinks below 500 ms (unless the region itself is smaller).
+      const card = edl.cards.find((c) => c.id === state.cardId);
+      if (!card) return;
+      const range = keptRanges(index, edl).find(
+        (r) => card.atMs >= r.startMs && card.atMs < r.endMs
+      );
+      const maxEnd = range ? range.endMs : Math.min(edl.trimEndMs, durationMs);
+      const maxDur = Math.max(0, maxEnd - card.atMs);
+      const dur = Math.max(Math.min(500, maxDur), Math.min(rawMs - card.atMs, maxDur));
+      setDragHint({ ms: rawMs, snapped: false, label: `Card · ${fmt(dur)}` });
+      onChange({
+        ...edl,
+        cards: edl.cards.map((c) => (c.id === card.id ? { ...c, durationMs: dur } : c)),
+      });
+      return;
+    }
+    if (state.kind === 'cardMove' && state.cardId) {
+      // Sliding the card re-places its insertion point. Snap like every other
+      // handle and keep the whole hold inside its kept region.
+      const card = edl.cards.find((c) => c.id === state.cardId);
+      if (!card) return;
+      const range = keptRanges(index, edl).find(
+        (r) => card.atMs >= r.startMs && card.atMs < r.endMs
+      );
+      const lo = range ? range.startMs : edl.trimStartMs;
+      const hi = Math.max(lo, (range ? range.endMs : edl.trimEndMs) - card.durationMs);
+      const at = Math.max(lo, Math.min(resolveTime(rawMs - (state.grabOffsetMs ?? 0)), hi));
+      setDragHint({ ms: at, snapped: edl.snapToKeyframes, label: `Card at ${fmt(at)}` });
+      onChange({
+        ...edl,
+        cards: edl.cards.map((c) => (c.id === card.id ? { ...c, atMs: at } : c)),
+      });
+      return;
+    }
     const ms = resolveTime(rawMs);
     setDragHint({ ms, snapped: edl.snapToKeyframes });
 
@@ -115,7 +163,7 @@ export default function EditTimeline({
         }),
       });
     }
-  }, [edl, durationMs, onChange, resolveTime]);
+  }, [edl, index, durationMs, onChange, resolveTime]);
 
   // Window-level listeners while dragging a handle or selecting a region.
   useEffect(() => {
@@ -145,12 +193,14 @@ export default function EditTimeline({
     };
   }, [drag, selecting, applyDrag, timeAtClientX]);
 
-  const startDrag = (e: React.MouseEvent, state: DragState) => {
+  const startDrag = (e: React.MouseEvent, state: DragState, applyImmediately = true) => {
     e.preventDefault();
     e.stopPropagation();
     dragRef.current = state;
     setDrag(state);
-    applyDrag(state, timeAtClientX(e.clientX));
+    // Card moves start relative to the grab point; a plain click (no move)
+    // must leave the card exactly where it is.
+    if (applyImmediately) applyDrag(state, timeAtClientX(e.clientX));
   };
 
   const onTrackMouseDown = (e: React.MouseEvent) => {
@@ -282,19 +332,47 @@ export default function EditTimeline({
           return (
             <div
               key={card.id}
-              className="absolute top-0 bottom-0 bg-emerald-400/40 border-x border-emerald-300"
+              className="absolute top-0 bottom-0 bg-emerald-400/40 border-x border-emerald-300 cursor-grab active:cursor-grabbing"
               style={{ left: `${leftPct}%`, width: `${Math.max(2, widthPct)}%` }}
-              title={`Title card "${card.text}"`}
+              title={`Title card "${card.text}" · ${fmt(card.durationMs)} — double-click to edit · drag to move · right edge to resize`}
               data-testid="card-marker"
+              data-at-ms={card.atMs}
+              data-duration-ms={card.durationMs}
+              onMouseDown={(e) =>
+                startDrag(
+                  e,
+                  {
+                    kind: 'cardMove',
+                    cardId: card.id,
+                    grabOffsetMs: timeAtClientX(e.clientX) - card.atMs,
+                  },
+                  false
+                )
+              }
+              onDoubleClick={(e) => { e.stopPropagation(); onEditCard(card); }}
             >
+              {holdProgress && holdProgress.cardId === card.id && (
+                <div
+                  className="absolute inset-y-0 left-0 bg-emerald-200/50 pointer-events-none"
+                  style={{ width: `${Math.max(0, Math.min(1, holdProgress.fraction)) * 100}%` }}
+                  data-testid="card-hold-fill"
+                />
+              )}
               <button
                 onMouseDown={(e) => e.stopPropagation()}
                 onClick={(e) => { e.stopPropagation(); removeCard(card.id); }}
-                className="absolute -top-2 -right-2 w-5 h-5 bg-emerald-500 hover:bg-emerald-400 rounded-full flex items-center justify-center"
+                className="absolute -top-2 -right-2 z-20 w-5 h-5 bg-emerald-500 hover:bg-emerald-400 rounded-full flex items-center justify-center"
                 title="Remove title card"
               >
                 <X size={11} className="text-white" />
               </button>
+              {/* Right-edge handle: lengthen/shorten the hold after placement */}
+              <div
+                onMouseDown={(e) => startDrag(e, { kind: 'cardEnd', cardId: card.id })}
+                className="absolute inset-y-0 right-0 w-2.5 cursor-ew-resize bg-emerald-300/60 hover:bg-emerald-200 z-20"
+                title="Hold length"
+                data-testid="handle-card-end"
+              />
             </div>
           );
         })}
@@ -346,6 +424,7 @@ export default function EditTimeline({
         <div
           className="absolute -top-1 -bottom-1 w-0.5 bg-white shadow z-20 pointer-events-none"
           style={{ left: pct(playheadMs) }}
+          data-testid="playhead"
         />
 
         {/* Drag badge */}
@@ -353,8 +432,9 @@ export default function EditTimeline({
           <div
             className="absolute -top-8 px-2 py-1 bg-gray-900 border border-gray-600 rounded text-[10px] text-gray-200 whitespace-nowrap z-30 pointer-events-none"
             style={{ left: pct(dragHint.ms), transform: 'translateX(-50%)' }}
+            data-testid="drag-hint"
           >
-            {dragHint.snapped ? `Snapped to keyframe · ${fmt(dragHint.ms)}` : `Frame-accurate · ${fmt(dragHint.ms)}`}
+            {dragHint.label ?? (dragHint.snapped ? `Snapped to keyframe · ${fmt(dragHint.ms)}` : `Frame-accurate · ${fmt(dragHint.ms)}`)}
           </div>
         )}
       </div>

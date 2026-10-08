@@ -90,6 +90,10 @@ export default function RecordPage() {
   const [edlPast, setEdlPast] = useState<EdlState[]>([]);
   const [edlFuture, setEdlFuture] = useState<EdlState[]>([]);
   const [cardModalAtMs, setCardModalAtMs] = useState<number | null>(null);
+  // Card being edited in the modal (null = inserting a new card).
+  const [editingCardId, setEditingCardId] = useState<string | null>(null);
+  // Live hold progress of the card currently playing in the edit preview.
+  const [cardHold, setCardHold] = useState<{ cardId: string; fraction: number } | null>(null);
   const [isRenderingEdit, setIsRenderingEdit] = useState(false);
   // True while the edit list is being built (Edit button shows a spinner).
   const [isIndexing, setIsIndexing] = useState(false);
@@ -707,6 +711,8 @@ export default function RecordPage() {
     if (editMode) {
       setEditMode(false);
       setCardModalAtMs(null);
+      setEditingCardId(null);
+      setCardHold(null);
       return;
     }
     if (!recordedBlob) return;
@@ -752,11 +758,25 @@ export default function RecordPage() {
     setCardModalAtMs(atMs);
   }, []);
 
+  const handleEditCard = useCallback((card: TitleCardSpec) => {
+    setEditingCardId(card.id);
+    setCardModalAtMs(card.atMs);
+  }, []);
+
   const handleCardConfirm = useCallback((spec: Omit<TitleCardSpec, 'id'>) => {
     if (!edl) return;
-    updateEdl({ ...edl, cards: [...edl.cards, { ...spec, id: `card-${Date.now()}` }] });
+    if (editingCardId) {
+      // Edit: replace the card in place, keeping its identity and position.
+      updateEdl({
+        ...edl,
+        cards: edl.cards.map((c) => (c.id === editingCardId ? { ...spec, id: editingCardId } : c)),
+      });
+    } else {
+      updateEdl({ ...edl, cards: [...edl.cards, { ...spec, id: `card-${Date.now()}` }] });
+    }
     setCardModalAtMs(null);
-  }, [edl, updateEdl]);
+    setEditingCardId(null);
+  }, [edl, editingCardId, updateEdl]);
 
   /** Output duration of the current EDL (kept source spans + title cards). */
   const editedDurationMs = useMemo(() => {
@@ -885,6 +905,8 @@ export default function RecordPage() {
     setEdlPast([]);
     setEdlFuture([]);
     setCardModalAtMs(null);
+    setEditingCardId(null);
+    setCardHold(null);
     setPlayheadMs(0);
     // The UI has dropped the recording — release its storage (temp file)
     releaseStoredRecording();
@@ -931,8 +953,9 @@ export default function RecordPage() {
         <TitleCardModal
           index={editIndex}
           atMs={cardModalAtMs}
+          card={editingCardId ? edl?.cards.find((c) => c.id === editingCardId) : undefined}
           onConfirm={handleCardConfirm}
-          onClose={() => setCardModalAtMs(null)}
+          onClose={() => { setCardModalAtMs(null); setEditingCardId(null); }}
         />
       )}
 
@@ -1050,13 +1073,13 @@ export default function RecordPage() {
                     </div>
                   </div>
                 )}
-                {!isVideoLoading && recordedVideoUrl && (
-                  <MinimalVideoPlayer
+                {!isVideoLoading && recordedVideoUrl && (                <MinimalVideoPlayer
                     src={recordedVideoUrl}
                     onVideoElement={handleVideoElement}
                     onTimeUpdate={setPlayheadMs}
+                    onCardProgress={setCardHold}
                     preview={playerPreview}
-                  />
+                />
                 )}
               </div>
 
@@ -1071,9 +1094,11 @@ export default function RecordPage() {
                   onChange={updateEdl}
                   onSeek={handleSeek}
                   onAddCard={handleAddCard}
+                  onEditCard={handleEditCard}
                   onUndo={handleUndo}
                   onRedo={handleRedo}
                   onDone={() => setEditMode(false)}
+                  holdProgress={cardHold}
                 />
               )}
 

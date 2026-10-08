@@ -15,19 +15,22 @@ import { drawTitleCard, grabFrame } from '@/utils/webmEdit';
 interface TitleCardModalProps {
   index: IndexedRecording;
   atMs: number;
+  /** When set, the modal edits this card instead of inserting a new one. */
+  card?: TitleCardSpec;
   onConfirm: (spec: Omit<TitleCardSpec, 'id'>) => void;
   onClose: () => void;
 }
 
 const DURATIONS = [3000, 5000, 8000, 10000];
 
-export default function TitleCardModal({ index, atMs, onConfirm, onClose }: TitleCardModalProps) {
+export default function TitleCardModal({ index, atMs, card, onConfirm, onClose }: TitleCardModalProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const frameRef = useRef<VideoFrame | null>(null);
-  const [text, setText] = useState('Step 1 — describe this step');
-  const [durationMs, setDurationMs] = useState(5000);
-  const [fontSizePct, setFontSizePct] = useState(0.05);
-  const [box, setBox] = useState({ x: 0.15, y: 0.62, w: 0.7, h: 0.22 });
+  // Prefilled from the card when editing; fresh-card defaults otherwise.
+  const [text, setText] = useState(card?.text ?? 'Step 1 — describe this step');
+  const [durationMs, setDurationMs] = useState(card?.durationMs ?? 5000);
+  const [fontSizePct, setFontSizePct] = useState(card?.fontSizePct ?? 0.05);
+  const [box, setBox] = useState(card ? { ...card.box } : { x: 0.15, y: 0.62, w: 0.7, h: 0.22 });
   const [frameError, setFrameError] = useState<string | null>(null);
   const [frameReady, setFrameReady] = useState(false);
   // Bumped by the Retry button to re-run a failed frame capture.
@@ -130,7 +133,7 @@ export default function TitleCardModal({ index, atMs, onConfirm, onClose }: Titl
               <Type size={20} className="text-emerald-400" />
             </div>
             <div>
-              <h2 className="text-xl font-semibold text-gray-100">Insert title card</h2>
+              <h2 className="text-xl font-semibold text-gray-100">{card ? 'Edit title card' : 'Insert title card'}</h2>
               <p className="text-sm text-gray-400">Freezes this moment with your text over it</p>
             </div>
           </div>
@@ -244,7 +247,7 @@ export default function TitleCardModal({ index, atMs, onConfirm, onClose }: Titl
             className="flex-1 px-4 py-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-medium transition disabled:opacity-40"
             data-testid="card-confirm"
           >
-            Insert card ({durationMs / 1000}s)
+            {card ? `Update card (${durationMs / 1000}s)` : `Insert card (${durationMs / 1000}s)`}
           </button>
         </div>
       </div>
